@@ -1,16 +1,22 @@
+#!/usr/bin/env python3
+"""
+Phylo-Pipe Pro - Command Line Interface
+Advanced phylogenetic analysis pipeline with Docker containers
+"""
+
 import os
-import subprocess
 import sys
+import argparse
+import subprocess
+import json
 from pathlib import Path
-import threading
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from datetime import datetime
+from typing import Dict, List, Tuple
 
 # ==============================================================================
-# --- 1. CONFIGURAÇÕES E FUNÇÕES DE AJUDA (Adaptação do seu código) ---
+# CONFIGURATION
 # ==============================================================================
 
-# --- Configuração dos Nomes dos Containers ---
 CONTAINERS = {
     "mafft": "quay.io/biocontainers/mafft:7.525--h031d066_0",
     "trimal": "quay.io/biocontainers/trimal:1.5",
@@ -19,12 +25,161 @@ CONTAINERS = {
     "mrbayes": "quay.io/biocontainers/mrbayes:3.2.7--hd0d793b_7"
 }
 
-# --- Função Auxiliar para Rodar Comandos Docker (ADAPTADA para GUI) ---
-def run_docker_command(container_name: str, command: list, log_callback, interactive: bool = False):
+# Color codes for terminal output
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
+# ==============================================================================
+# VALIDATION FUNCTIONS
+# ==============================================================================
+
+def validate_fasta(filepath: Path) -> Tuple[bool, List[str], Dict]:
     """
-    Executa um comando dentro de um container Docker e reporta o output completo 
-    para a GUI via log_callback. Levanta erro em caso de falha.
+    Validate FASTA file format and content.
+    Returns: (is_valid, issues_list, statistics_dict)
     """
+    issues = []
+    sequences = {}
+    
+    try:
+        with open(filepath, 'r') as f:
+            current_id = None
+            current_seq = []
+            
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                if line.startswith('>'):
+                    if current_id:
+                        sequences[current_id] = ''.join(current_seq)
+                    
+                    current_id = line[1:].split()[0]
+                    if not current_id:
+                        issues.append(f"Line {line_num}: Empty sequence ID")
+                    elif current_id in sequences:
+                        issues.append(f"Line {line_num}: Duplicate ID '{current_id}'")
+                    current_seq = []
+                else:
+                    # Validate characters
+                    invalid_chars = set(line.upper()) - set('ACGTRYSWKMBDHVN-')
+                    if invalid_chars:
+                        issues.append(
+                            f"Line {line_num}: Invalid characters {invalid_chars} "
+                            f"(only IUPAC DNA codes allowed)"
+                        )
+                    current_seq.append(line.upper())
+            
+            # Add last sequence
+            if current_id:
+                sequences[current_id] = ''.join(current_seq)
+        
+        if not sequences:
+            issues.append("No sequences found in file")
+            return False, issues, {}
+        
+        if len(sequences) < 3:
+            issues.append(f"Only {len(sequences)} sequences found (minimum 3 recommended)")
+        
+        # Calculate statistics
+        seq_lengths = [len(seq.replace('-', '')) for seq in sequences.values()]
+        
+        stats = {
+            'num_sequences': len(sequences),
+            'min_length': min(seq_lengths),
+            'max_length': max(seq_lengths),
+            'avg_length': sum(seq_lengths) / len(seq_lengths),
+            'total_length': sum(seq_lengths),
+            'sequences': sequences
+        }
+        
+        # Check for very different lengths
+        if stats['max_length'] > stats['min_length'] * 3:
+            issues.append(
+                f"WARNING: Large length variation "
+                f"({stats['min_length']}-{stats['max_length']} bp)"
+            )
+        
+        return len([i for i in issues if not i.startswith('WARNING')]) == 0, issues, stats
+        
+    except Exception as e:
+        return False, [f"Error reading file: {str(e)}"], {}
+
+def analyze_alignment(filepath: Path) -> Dict:
+    """Analyze alignment quality metrics."""
+    try:
+        sequences = {}
+        with open(filepath, 'r') as f:
+            current_id = None
+            current_seq = []
+            for line in f:
+                line = line.strip()
+                if line.startswith('>'):
+                    if current_id:
+                        sequences[current_id] = ''.join(current_seq)
+                    current_id = line[1:]
+                    current_seq = []
+                elif line:
+                    current_seq.append(line.upper())
+            if current_id:
+                sequences[current_id] = ''.join(current_seq)
+        
+        if not sequences:
+            return {}
+        
+        alignment_length = len(list(sequences.values())[0])
+        total_gaps = sum(seq.count('-') for seq in sequences.values())
+        total_positions = len(sequences) * alignment_length
+        
+        # Pairwise identity
+        identity_sum = 0
+        comparisons = 0
+        seq_list = list(sequences.values())
+        
+        for i in range(len(seq_list)):
+            for j in range(i+1, len(seq_list)):
+                matches = sum(
+                    1 for a, b in zip(seq_list[i], seq_list[j])
+                    if a == b and a != '-'
+                )
+                identity_sum += matches / alignment_length
+                comparisons += 1
+        
+        avg_identity = (identity_sum / comparisons * 100) if comparisons > 0 else 0
+        
+        # Calculate conserved positions
+        conserved = 0
+        for pos in range(alignment_length):
+            column = [seq[pos] for seq in seq_list if seq[pos] != '-']
+            if column and len(set(column)) == 1:
+                conserved += 1
+        
+        return {
+            'alignment_length': alignment_length,
+            'gap_percentage': (total_gaps / total_positions * 100),
+            'avg_identity': avg_identity,
+            'conserved_positions': conserved,
+            'conserved_percentage': (conserved / alignment_length * 100)
+        }
+    except Exception as e:
+        print(f"{Colors.YELLOW}Warning: Could not analyze alignment: {e}{Colors.END}")
+        return {}
+
+# ==============================================================================
+# DOCKER EXECUTION
+# ==============================================================================
+
+def run_docker_command(container_name: str, command: List[str], verbose: bool = True) -> bool:
+    """Execute Docker command with real-time output."""
     work_dir = Path.cwd().resolve()
     
     docker_base = [
@@ -33,302 +188,469 @@ def run_docker_command(container_name: str, command: list, log_callback, interac
         "-w", "/data"
     ]
     
-    if interactive:
-        # Modo interativo (para MrBayes)
-        docker_base.extend(["-it"]) 
-        
     full_command = docker_base + [CONTAINERS[container_name]] + command
-
-    log_callback(f"\n--- Executando: {' '.join(full_command)} ---", is_highlight=True)
+    
+    if verbose:
+        print(f"\n{Colors.CYAN}🔧 Executing:{Colors.END} {' '.join(full_command)}")
     
     try:
-        # Comando bloqueante, mas executado em Thread separada.
-        process = subprocess.run(
-            full_command, 
-            text=True, 
-            check=True, 
-            capture_output=True
+        process = subprocess.Popen(
+            full_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
         )
         
-        # Reporta o output completo (STDOUT)
-        if process.stdout:
-             log_callback("--- SAÍDA DO CONTAINER (STDOUT) ---")
-             log_callback(process.stdout)
+        # Stream output in real-time
+        stdout_lines = []
+        stderr_lines = []
         
-        log_callback("--- Comando concluído com sucesso! ---", is_success=True)
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                stdout_lines.append(output.strip())
+                if verbose:
+                    print(output.strip())
+        
+        stderr_output = process.stderr.read()
+        if stderr_output:
+            stderr_lines.append(stderr_output.strip())
+        
+        returncode = process.poll()
+        
+        if returncode != 0:
+            print(f"\n{Colors.RED} ERROR: Command failed with exit code {returncode}{Colors.END}")
+            if stderr_output and verbose:
+                print(f"{Colors.RED}STDERR:\n{stderr_output}{Colors.END}")
+            return False
+        
+        if verbose:
+            print(f"{Colors.GREEN} Command completed successfully!{Colors.END}")
         return True
         
-    except subprocess.CalledProcessError as e:
-        # Em caso de erro do comando
-        log_callback(f"ERRO DE EXECUÇÃO: Comando {container_name} falhou.", is_error=True)
-        log_callback(f"STATUS CODE: {e.returncode}", is_error=True)
-        if e.stdout: log_callback(f"STDOUT:\n{e.stdout}", is_error=True)
-        if e.stderr: log_callback(f"STDERR (ERRO):\n{e.stderr}", is_error=True)
-        
-        # Levanta a exceção para que a função chamadora interrompa o pipeline
-        raise 
-        
     except Exception as e:
-        # Outros erros (ex: Docker não instalado)
-        log_callback(f"ERRO DESCONHECIDO NO DOCKER: {e}", is_error=True)
-        raise
+        print(f"{Colors.RED} Docker execution error: {e}{Colors.END}")
+        return False
 
 # ==============================================================================
-# --- 2. CLASSE DA APLICAÇÃO GUI (CustomTkinter) ---
+# PIPELINE STAGES
 # ==============================================================================
 
-class PhylogenyApp(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-
-        # --- Configuração Básica da Janela ---
-        self.title("Pipeline de Filogenia (Docker) - por Walter")
-        self.geometry("800x650")
-        ctk.set_appearance_mode("System")
-
-        # Variáveis de Controle
-        self.input_file_path = ctk.StringVar(value="")
-        self.choice_var = ctk.StringVar(value="2") # ML (IQ-TREE) como padrão
-        
-        # Estrutura do Layout (Grid)
-        self.grid_columnconfigure(0, weight=1) 
-        self.grid_rowconfigure(2, weight=1)   
-
-        # 1. Frame de Entrada (Input Frame)
-        self.input_frame = ctk.CTkFrame(self)
-        self.input_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
-        self.create_input_widgets(self.input_frame)
-
-        # 2. Frame de Opções (Options Frame)
-        self.options_frame = ctk.CTkFrame(self)
-        self.options_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
-        self.create_options_widgets(self.options_frame)
-        
-        # 3. Frame de Log (Log Frame)
-        self.log_frame = ctk.CTkFrame(self)
-        self.log_frame.grid(row=2, column=0, padx=10, pady=10, sticky="nsew")
-        self.create_log_widgets(self.log_frame)
-
-    # --- Criação de Widgets ---
+def stage_alignment(input_file: Path, strategy: str = 'auto', verbose: bool = True) -> Path:
+    """Stage 1: Multiple sequence alignment with MAFFT."""
+    aligned_file = input_file.with_suffix('').with_suffix('.aligned.fasta')
     
-    def create_input_widgets(self, parent):
-        parent.grid_columnconfigure(1, weight=1)
-        
-        ctk.CTkLabel(parent, text="Arquivo Multi-FASTA:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        
-        # Campo de Texto para exibir o caminho
-        ctk.CTkEntry(parent, textvariable=self.input_file_path, state="readonly").grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        
-        # Botão 'Browse'
-        ctk.CTkButton(parent, text="Selecionar Arquivo", command=self.select_file).grid(row=0, column=2, padx=5, pady=5)
-        
-        # Botão 'Executar'
-        self.start_button = ctk.CTkButton(parent, text="▶️ INICIAR PIPELINE", command=self.start_pipeline, fg_color="#1F538D") # Cor azul personalizada
-        self.start_button.grid(row=1, column=0, columnspan=3, pady=10)
+    print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}STAGE 1: MULTIPLE SEQUENCE ALIGNMENT{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.BLUE}Tool:{Colors.END} MAFFT")
+    print(f"{Colors.BLUE}Strategy:{Colors.END} {strategy}")
+    print(f"{Colors.BLUE}Input:{Colors.END} {input_file}")
+    print(f"{Colors.BLUE}Output:{Colors.END} {aligned_file}")
+    
+    cmd = ['sh', '-c', f"mafft --{strategy} /data/{input_file.name} > /data/{aligned_file.name}"]
+    
+    if not run_docker_command("mafft", cmd, verbose):
+        raise RuntimeError("MAFFT alignment failed")
+    
+    # Analyze alignment
+    stats = analyze_alignment(aligned_file)
+    if stats:
+        print(f"\n{Colors.CYAN} Alignment Quality:{Colors.END}")
+        print(f"  • Length: {stats['alignment_length']} bp")
+        print(f"  • Gap percentage: {stats['gap_percentage']:.2f}%")
+        print(f"  • Average identity: {stats['avg_identity']:.2f}%")
+        print(f"  • Conserved positions: {stats['conserved_positions']} ({stats['conserved_percentage']:.2f}%)")
+    
+    return aligned_file
 
-    def create_options_widgets(self, parent):
-        parent.grid_columnconfigure((0, 1, 2, 3), weight=1)
-        ctk.CTkLabel(parent, text="Método Filogenético:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        
-        # Radio Buttons
-        options = [
-            ("1 - Neighbor-Joining (NJ)", '1'),
-            ("2 - Máxima Verossimilhança (ML) - IQ-TREE", '2'),
-            ("3 - Inferência Bayesiana (BI) - MrBayes (Interativo)", '3')
-        ]
-        
-        for i, (text, value) in enumerate(options):
-            ctk.CTkRadioButton(parent, text=text, variable=self.choice_var, value=value).grid(row=0, column=i+1, padx=10, pady=5, sticky="w")
+def stage_trimming(aligned_file: Path, method: str = 'automated1', verbose: bool = True) -> Path:
+    """Stage 2: Alignment trimming with trimAl."""
+    trimmed_file = aligned_file.with_suffix('').with_suffix('.trimmed.fasta')
+    
+    print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}STAGE 2: ALIGNMENT TRIMMING{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.BLUE}Tool:{Colors.END} trimAl")
+    print(f"{Colors.BLUE}Method:{Colors.END} {method}")
+    print(f"{Colors.BLUE}Input:{Colors.END} {aligned_file}")
+    print(f"{Colors.BLUE}Output:{Colors.END} {trimmed_file}")
+    
+    cmd = [
+        'trimal',
+        '-in', f'/data/{aligned_file.name}',
+        '-out', f'/data/{trimmed_file.name}',
+        f'-{method}'
+    ]
+    
+    if not run_docker_command("trimal", cmd, verbose):
+        raise RuntimeError("trimAl filtering failed")
+    
+    # Analyze trimmed alignment
+    stats = analyze_alignment(trimmed_file)
+    if stats:
+        print(f"\n{Colors.CYAN} Trimmed Alignment Quality:{Colors.END}")
+        print(f"  • Length: {stats['alignment_length']} bp")
+        print(f"  • Gap percentage: {stats['gap_percentage']:.2f}%")
+        print(f"  • Average identity: {stats['avg_identity']:.2f}%")
+    
+    return trimmed_file
 
-    def create_log_widgets(self, parent):
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
-        
-        ctk.CTkLabel(parent, text="Log de Execução:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        
-        # Campo de Texto para Log (ReadOnly)
-        self.log_text = ctk.CTkTextbox(parent, wrap="word", height=250)
-        self.log_text.grid(row=1, column=0, padx=5, pady=5, sticky="nsew")
-        self.log_text.configure(state="disabled")
-        
-        # Configurações de tag para cores no log
-        self.log_text.tag_config('error', foreground='red')
-        self.log_text.tag_config('success', foreground='green')
-        self.log_text.tag_config('highlight', foreground='blue') # Para comandos
-
-    # --- Funções de Lógica da GUI ---
-
-    def select_file(self):
-        filepath = filedialog.askopenfilename(
-            title="Selecione o Arquivo Multi-FASTA",
-            filetypes=(("FASTA files", "*.fasta *.fa"), ("All files", "*.*"))
-        )
-        if filepath:
-            # Garante que o diretório de trabalho seja o do arquivo (simplifica a montagem Docker)
-            os.chdir(Path(filepath).parent) 
-            self.input_file_path.set(Path(filepath).name)
-            self.log("Arquivo selecionado e diretório de trabalho definido para: " + str(Path(filepath).parent))
-
-    def log(self, message: str, is_error: bool = False, is_success: bool = False, is_highlight: bool = False):
-        """Atualiza a caixa de texto de log de forma segura."""
-        self.log_text.configure(state="normal")
-        
-        tag = ''
-        if is_error:
-            tag = 'error'
-        elif is_success:
-            tag = 'success'
-        elif is_highlight:
-            tag = 'highlight'
-            
-        self.log_text.insert("end", message + "\n", tag)
-        self.log_text.see("end") 
-        self.log_text.configure(state="disabled")
-        self.update() 
-
-    def toggle_interface(self, state):
-        """Habilita ou desabilita botões e opções."""
-        self.start_button.configure(state=state)
-        # Habilita/desabilita as opções (RadioButtons)
-        for widget in self.options_frame.winfo_children():
-            if isinstance(widget, ctk.CTkRadioButton):
-                widget.configure(state=state)
-
-    def start_pipeline(self):
-        # Checa e prepara o log
-        input_file = self.input_file_path.get()
-        if not input_file:
-            messagebox.showerror("Erro de Input", "Por favor, selecione um arquivo FASTA de entrada.")
-            return
-
-        # Limpar Log e Desabilitar Interface antes de começar
-        self.toggle_interface(state="disabled")
-        self.log_text.configure(state="normal")
-        self.log_text.delete(1.0, "end")
-        self.log_text.configure(state="disabled")
-        
-        self.log("Iniciando o Pipeline de Filogenia (usando Thread para não travar a GUI)...", is_highlight=True)
-        
-        # Cria e inicia a thread para rodar a lógica principal
-        pipeline_thread = threading.Thread(target=self.run_pipeline_logic, daemon=True)
-        pipeline_thread.start()
-
-    # --- Função Principal do Pipeline (Executada em Thread) ---
-
-    def run_pipeline_logic(self):
-        # AQUI usamos o Path().name pois o diretório já foi definido e o Docker 
-        # montará o diretório de trabalho atual (cwd)
-        input_file_name = self.input_file_path.get()
-        
-        aligned_file = Path(input_file_name).with_suffix('').name + ".aligned.fasta"
-        trimmed_file = Path(input_file_name).with_suffix('').name + ".trimmed.fasta"
-        choice = self.choice_var.get()
-        
-        try:
-            # --- PASSO 1: ALINHAMENTO (MAFFT) ---
-            self.log(f"\n[PASSO 1/3] Alinhando '{input_file_name}' com MAFFT...")
-            mafft_cmd = ['sh', '-c', f"mafft --auto /data/{input_file_name} > /data/{aligned_file}"]
-            run_docker_command("mafft", mafft_cmd, self.log)
-
-            # --- PASSO 2: TRIMAGEM (trimAl) ---
-            self.log(f"\n[PASSO 2/3] Filtrando alinhamento com trimAl...")
-            trimal_cmd = ['trimal', '-in', f'/data/{aligned_file}', '-out', f'/data/{trimmed_file}', '-automated1']
-            run_docker_command("trimal", trimal_cmd, self.log)
-
-            # --- PASSO 3: CONSTRUÇÃO DA ÁRVORE ---
-            self.log(f"\n[PASSO 3/3] Executando o método de escolha (Opção {choice})...")
-
-            if choice == '1':
-                # --- Rota 1: Neighbor-Joining (Biopython) ---
-                self.log("Executando Neighbor-Joining (NJ)...")
-                nj_script_name = "_temp_nj_script.py"
-                nj_output_file = Path(input_file_name).with_suffix('').name + ".nj_tree.newick"
-                
-                # Conteúdo do script Biopython
-                nj_script_content = f"""
+def stage_tree_nj(trimmed_file: Path, verbose: bool = True) -> Path:
+    """Stage 3A: Neighbor-Joining tree construction."""
+    output_file = trimmed_file.with_suffix('').with_suffix('.nj_tree.newick')
+    
+    print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}STAGE 3: TREE CONSTRUCTION - NEIGHBOR-JOINING{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.BLUE}Method:{Colors.END} Distance-based (Neighbor-Joining)")
+    print(f"{Colors.BLUE}Input:{Colors.END} {trimmed_file}")
+    print(f"{Colors.BLUE}Output:{Colors.END} {output_file}")
+    
+    script_content = f"""
 from Bio import Phylo, AlignIO
 from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
 import sys
 sys.dont_write_bytecode = True
-print('Lendo alinhamento...')
-aln = AlignIO.read('/data/{trimmed_file}', 'fasta')
-print('Calculando matriz de distância...')
+
+print('Reading alignment...')
+aln = AlignIO.read('/data/{trimmed_file.name}', 'fasta')
+
+print('Calculating distance matrix...')
 calculator = DistanceCalculator('identity')
 constructor = DistanceTreeConstructor(calculator, 'nj')
+
+print('Building NJ tree...')
 tree = constructor.build_tree(aln)
 tree.ladderize()
-Phylo.write(tree, '/data/{nj_output_file}', 'newick')
-print(f'Árvore NJ salva em: {nj_output_file}')
-print('\\n--- Árvore ASCII ---')
+
+print('Saving tree...')
+Phylo.write(tree, '/data/{output_file.name}', 'newick')
+
+print('\\n--- Tree Visualization ---')
 Phylo.draw_ascii(tree)
 """
-                with open(nj_script_name, "w") as f:
-                    f.write(nj_script_content)
-                
-                biopython_cmd = ['python', f'/data/{nj_script_name}']
-                run_docker_command("biopython", biopython_cmd, self.log)
-                
-                os.remove(nj_script_name)
-                self.log(f"Árvore NJ salva em: {nj_output_file}", is_success=True)
+    
+    script_file = Path("_temp_nj_script.py")
+    script_file.write_text(script_content)
+    
+    try:
+        cmd = ['python', f'/data/{script_file.name}']
+        if not run_docker_command("biopython", cmd, verbose):
+            raise RuntimeError("NJ tree construction failed")
+    finally:
+        script_file.unlink(missing_ok=True)
+    
+    print(f"\n{Colors.GREEN} NJ tree saved to: {output_file}{Colors.END}")
+    return output_file
 
-            elif choice == '2':
-                # --- Rota 2: Máxima Verossimilhança (IQ-TREE) ---
-                self.log("Executando Máxima Verossimilhança (ML) - IQ-TREE (ModelFinder e 1000 Boostraps)...")
-                iqtree_cmd = ['iqtree', '-s', f'/data/{trimmed_file}', '-m', 'MFP', '-B', '1000']
-                run_docker_command("iqtree", iqtree_cmd, self.log)
-                self.log(f"Árvore ML salva em: {trimmed_file}.treefile", is_success=True)
+def stage_tree_ml(trimmed_file: Path, model: str = 'MFP', bootstrap: int = 1000, 
+                  verbose: bool = True) -> Path:
+    """Stage 3B: Maximum Likelihood tree with IQ-TREE."""
+    output_file = trimmed_file.with_suffix('.treefile')
+    
+    print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}STAGE 3: TREE CONSTRUCTION - MAXIMUM LIKELIHOOD{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.BLUE}Tool:{Colors.END} IQ-TREE")
+    print(f"{Colors.BLUE}Model:{Colors.END} {model} (ModelFinder if MFP)")
+    print(f"{Colors.BLUE}Bootstrap:{Colors.END} {bootstrap} replicates")
+    print(f"{Colors.BLUE}Input:{Colors.END} {trimmed_file}")
+    print(f"{Colors.BLUE}Output:{Colors.END} {output_file}")
+    
+    cmd = [
+        'iqtree',
+        '-s', f'/data/{trimmed_file.name}',
+        '-m', model,
+        '-B', str(bootstrap)
+    ]
+    
+    if not run_docker_command("iqtree", cmd, verbose):
+        raise RuntimeError("IQ-TREE analysis failed")
+    
+    print(f"\n{Colors.GREEN} ML tree saved to: {output_file}{Colors.END}")
+    return output_file
 
-            elif choice == '3':
-                # --- Rota 3: Inferência Bayesiana (MrBayes) ---
-                self.log("Iniciando setup para Inferência Bayesiana (BI)...")
-                nexus_file = Path(input_file_name).with_suffix('').name + ".trimmed.nex"
-                
-                # Conversão FASTA para NEXUS
-                self.log("Convertendo FASTA para NEXUS (usando Biopython)...")
-                biopython_convert_cmd = [
-                    'python', '-c', 
-                    f"from Bio import AlignIO; AlignIO.convert('/data/{trimmed_file}', 'fasta', '/data/{nexus_file}', 'nexus', molecule_type='DNA')"
-                ]
-                run_docker_command("biopython", biopython_convert_cmd, self.log)
-                
-                self.log("\n*** MODO INTERATIVO DO MRBAYES INICIADO ***", is_error=True)
-                self.log("Atenção: MrBayes requer interação manual no terminal para rodar o MCMC e SUMT.")
-                self.log("Comandos recomendados:", is_highlight=True)
-                self.log(f"1. execute /data/{nexus_file}")
-                self.log(f"2. lset nst=6 rates=gamma") # Exemplo de modelo
-                self.log(f"3. mcmc ngen=100000 samplefreq=100")
-                self.log(f"4. sumt")
-                self.log(f"5. quit")
-
-                mrbayes_cmd = ['mb']
-                # Esta chamada VAI travar o terminal onde a GUI foi chamada!
-                run_docker_command("mrbayes", mrbayes_cmd, self.log, interactive=True)
-                
-            else:
-                self.log(f"Escolha '{choice}' inválida. Saindo.", is_error=True)
-
-            self.log("\n*** PROJETO DE FILOGENIA CONCLUÍDO COM SUCESSO! ***", is_success=True)
-            messagebox.showinfo("Sucesso", "Pipeline de Filogenia concluído!")
-
-        except Exception:
-            # O erro já foi reportado pelo log na função run_docker_command
-            messagebox.showerror("Erro no Pipeline", "O pipeline foi interrompido devido a um erro. Verifique o log para detalhes.")
-
-        finally:
-            # Re-habilita a interface, independente de sucesso ou falha
-            self.toggle_interface(state="normal")
-            self.log("Interface re-habilitada para nova execução.")
-
+def stage_tree_bayesian(trimmed_file: Path, ngen: int = 100000, nchains: int = 4,
+                       verbose: bool = True) -> Path:
+    """Stage 3C: Bayesian Inference with MrBayes."""
+    nexus_file = trimmed_file.with_suffix('.nex')
+    output_file = Path(str(nexus_file) + '.con.tre')
+    
+    print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}STAGE 3: TREE CONSTRUCTION - BAYESIAN INFERENCE{Colors.END}")
+    print(f"{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
+    print(f"{Colors.BLUE}Tool:{Colors.END} MrBayes")
+    print(f"{Colors.BLUE}Model:{Colors.END} GTR+G")
+    print(f"{Colors.BLUE}Generations:{Colors.END} {ngen:,}")
+    print(f"{Colors.BLUE}Chains:{Colors.END} {nchains}")
+    print(f"{Colors.BLUE}Input:{Colors.END} {trimmed_file}")
+    print(f"{Colors.BLUE}Output:{Colors.END} {output_file}")
+    
+    # Convert FASTA to NEXUS
+    print(f"\n{Colors.CYAN}Converting FASTA to NEXUS format...{Colors.END}")
+    convert_cmd = [
+        'python', '-c',
+        f"from Bio import AlignIO; AlignIO.convert('/data/{trimmed_file.name}', 'fasta', "
+        f"'/data/{nexus_file.name}', 'nexus', molecule_type='DNA')"
+    ]
+    
+    if not run_docker_command("biopython", convert_cmd, verbose):
+        raise RuntimeError("FASTA to NEXUS conversion failed")
+    
+    # Add MrBayes commands
+    burnin = int(ngen * 0.25 / 100)  # 25% burnin
+    
+    mrbayes_block = f"""
+begin mrbayes;
+    set autoclose=yes nowarn=yes;
+    
+    [ Substitution model: GTR+Gamma ]
+    lset nst=6 rates=gamma;
+    
+    [ MCMC parameters ]
+    mcmc ngen={ngen} samplefreq=100 nchains={nchains} nruns=2;
+    
+    [ Summarize results (25% burnin) ]
+    sump burnin={burnin};
+    sumt burnin={burnin};
+    
+    quit;
+end;
+"""
+    
+    with open(nexus_file, 'a') as f:
+        f.write(mrbayes_block)
+    
+    # Run MrBayes
+    print(f"\n{Colors.CYAN}Running MrBayes (this may take a while)...{Colors.END}")
+    cmd = ['mb', f'/data/{nexus_file.name}']
+    
+    if not run_docker_command("mrbayes", cmd, verbose):
+        raise RuntimeError("MrBayes analysis failed")
+    
+    print(f"\n{Colors.GREEN} Bayesian consensus tree saved to: {output_file}{Colors.END}")
+    return output_file
 
 # ==============================================================================
-# --- 3. EXECUÇÃO ---
+# MAIN PIPELINE
 # ==============================================================================
+
+def run_pipeline(input_file: Path, method: str, params: Dict, verbose: bool = True):
+    """Run complete phylogenetic analysis pipeline."""
+    
+    start_time = datetime.now()
+    
+    print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*70}{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.HEADER} PHYLO-PIPE - PHYLOGENETIC ANALYSIS{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.HEADER}{'='*70}{Colors.END}")
+    print(f"{Colors.BLUE}Input file:{Colors.END} {input_file}")
+    print(f"{Colors.BLUE}Method:{Colors.END} {method}")
+    print(f"{Colors.BLUE}Started:{Colors.END} {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{Colors.BOLD}{Colors.HEADER}{'='*70}{Colors.END}")
+    
+    # Validate input
+    print(f"\n{Colors.CYAN} Validating input file...{Colors.END}")
+    valid, issues, stats = validate_fasta(input_file)
+    
+    if issues:
+        print(f"\n{Colors.YELLOW}  Validation issues found:{Colors.END}")
+        for issue in issues:
+            color = Colors.YELLOW if issue.startswith('WARNING') else Colors.RED
+            print(f"  {color}• {issue}{Colors.END}")
+    
+    if not valid:
+        print(f"\n{Colors.RED} Input file validation failed. Cannot proceed.{Colors.END}")
+        sys.exit(1)
+    
+    print(f"\n{Colors.GREEN} Input validation passed{Colors.END}")
+    print(f"{Colors.CYAN} Input Statistics:{Colors.END}")
+    print(f"  • Sequences: {stats['num_sequences']}")
+    print(f"  • Length range: {stats['min_length']}-{stats['max_length']} bp")
+    print(f"  • Average length: {stats['avg_length']:.1f} bp")
+    
+    try:
+        # Stage 1: Alignment
+        aligned_file = stage_alignment(
+            input_file,
+            strategy=params.get('mafft_strategy', 'auto'),
+            verbose=verbose
+        )
+        
+        # Stage 2: Trimming
+        trimmed_file = stage_trimming(
+            aligned_file,
+            method=params.get('trimal_method', 'automated1'),
+            verbose=verbose
+        )
+        
+        # Stage 3: Tree construction
+        if method == 'nj':
+            output_file = stage_tree_nj(trimmed_file, verbose)
+        elif method == 'ml':
+            output_file = stage_tree_ml(
+                trimmed_file,
+                model=params.get('iqtree_model', 'MFP'),
+                bootstrap=params.get('iqtree_bootstrap', 1000),
+                verbose=verbose
+            )
+        elif method == 'bayesian':
+            output_file = stage_tree_bayesian(
+                trimmed_file,
+                ngen=params.get('mrbayes_ngen', 100000),
+                nchains=params.get('mrbayes_nchains', 4),
+                verbose=verbose
+            )
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        
+        # Summary
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*70}{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.GREEN} ANALYSIS COMPLETED SUCCESSFULLY!{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.GREEN}{'='*70}{Colors.END}")
+        print(f"{Colors.BLUE}Final tree:{Colors.END} {output_file}")
+        print(f"{Colors.BLUE}Execution time:{Colors.END} {duration:.2f} seconds ({duration/60:.1f} minutes)")
+        print(f"{Colors.BLUE}Finished:{Colors.END} {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{Colors.BOLD}{Colors.GREEN}{'='*70}{Colors.END}\n")
+        
+        return True
+        
+    except Exception as e:
+        print(f"\n{Colors.BOLD}{Colors.RED}{'='*70}{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.RED} PIPELINE FAILED{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.RED}{'='*70}{Colors.END}")
+        print(f"{Colors.RED}Error: {str(e)}{Colors.END}\n")
+        return False
+
+# ==============================================================================
+# CLI INTERFACE
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Phylo-Pipe',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Neighbor-Joining (fast)
+  python run_phylogeny.py -i sequences.fasta -m nj
+  
+  # Maximum Likelihood with 2000 bootstraps
+  python run_phylogeny.py -i sequences.fasta -m ml --bootstrap 2000
+  
+  # Bayesian Inference with 500k generations
+  python run_phylogeny.py -i sequences.fasta -m bayesian --ngen 500000
+  
+  # Custom MAFFT strategy
+  python run_phylogeny.py -i sequences.fasta -m ml --mafft-strategy localpair
+"""
+    )
+    
+    # Required arguments
+    parser.add_argument(
+        '-i', '--input',
+        type=Path,
+        required=True,
+        help='Input FASTA file with sequences'
+    )
+    
+    parser.add_argument(
+        '-m', '--method',
+        choices=['nj', 'ml', 'bayesian'],
+        required=True,
+        help='Phylogenetic method (nj=Neighbor-Joining, ml=Maximum Likelihood, bayesian=Bayesian Inference)'
+    )
+    
+    # MAFFT parameters
+    parser.add_argument(
+        '--mafft-strategy',
+        default='auto',
+        choices=['auto', 'localpair', 'globalpair', 'retree', 'fftns'],
+        help='MAFFT alignment strategy (default: auto)'
+    )
+    
+    # trimAl parameters
+    parser.add_argument(
+        '--trimal-method',
+        default='automated1',
+        choices=['automated1', 'strict', 'gappyout'],
+        help='trimAl filtering method (default: automated1)'
+    )
+    
+    # IQ-TREE parameters
+    parser.add_argument(
+        '--iqtree-model',
+        default='MFP',
+        help='IQ-TREE substitution model (default: MFP for ModelFinder)'
+    )
+    
+    parser.add_argument(
+        '--bootstrap',
+        type=int,
+        default=1000,
+        help='Number of bootstrap replicates for ML (default: 1000)'
+    )
+    
+    # MrBayes parameters
+    parser.add_argument(
+        '--ngen',
+        type=int,
+        default=100000,
+        help='Number of MCMC generations for Bayesian (default: 100000)'
+    )
+    
+    parser.add_argument(
+        '--nchains',
+        type=int,
+        default=4,
+        help='Number of MCMC chains for Bayesian (default: 4)'
+    )
+    
+    # General options
+    parser.add_argument(
+        '-q', '--quiet',
+        action='store_true',
+        help='Suppress detailed output'
+    )
+    
+    parser.add_argument(
+        '--version',
+        action='version',
+        version='Phylo-Pipe'
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate input file
+    if not args.input.exists():
+        print(f"{Colors.RED}Error: Input file '{args.input}' not found{Colors.END}")
+        sys.exit(1)
+    
+    # Build parameters dictionary
+    params = {
+        'mafft_strategy': args.mafft_strategy,
+        'trimal_method': args.trimal_method,
+        'iqtree_model': args.iqtree_model,
+        'iqtree_bootstrap': args.bootstrap,
+        'mrbayes_ngen': args.ngen,
+        'mrbayes_nchains': args.nchains
+    }
+    
+    # Run pipeline
+    success = run_pipeline(
+        args.input,
+        args.method,
+        params,
+        verbose=not args.quiet
+    )
+    
+    sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
-    # É necessário que o Docker esteja rodando e o CustomTkinter esteja instalado!
-    
-    # Define o diretório inicial para a GUI (o diretório onde este script está)
-    os.chdir(Path(__file__).parent) 
-    
-    app = PhylogenyApp()
-    app.mainloop()
+    main()
