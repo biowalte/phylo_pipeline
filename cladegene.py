@@ -484,7 +484,7 @@ class PhylogenyApp(QWidget):
         main_layout = QVBoxLayout(self)
         
         # Title
-        title = QLabel("🧬 CladeGene - Phylogenetic Analysis")
+        title = QLabel("Gene - Phylogenetic Analysis")
         title.setFont(QFont('Arial', 16, QFont.Bold))
         title.setStyleSheet("color: #1F456E; padding: 10px;")
         main_layout.addWidget(title)
@@ -540,9 +540,9 @@ class PhylogenyApp(QWidget):
         method_layout = QVBoxLayout(method_group)
         
         self.radio_group = QButtonGroup()
-        self.radio_nj = QRadioButton(" Neighbor-Joining (Fast, distance-based)")
-        self.radio_ml = QRadioButton(" Maximum Likelihood (Accurate, model-based)")
-        self.radio_bi = QRadioButton(" Bayesian Inference (Probabilistic, posterior)")
+        self.radio_nj = QRadioButton(" Neighbor-Joining")
+        self.radio_ml = QRadioButton(" Maximum Likelihood")
+        self.radio_bi = QRadioButton(" Bayesian Inference")
         
         self.radio_ml.setChecked(True)
         
@@ -618,7 +618,7 @@ class PhylogenyApp(QWidget):
             logo_layout.addWidget(logo_label)
         else:
             # Fallback if logo not found
-            fallback = QLabel("🧬 CladeGene")
+            fallback = QLabel("CladeGene")
             fallback.setAlignment(Qt.AlignCenter)
             fallback.setStyleSheet("color: #1F456E; font-size: 16pt; font-weight: bold;")
             logo_layout.addWidget(fallback)
