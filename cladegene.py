@@ -76,7 +76,8 @@ def validate_fasta(filepath):
             'min_length': min(seq_lengths),
             'max_length': max(seq_lengths),
             'avg_length': sum(seq_lengths) / len(seq_lengths),
-            'total_length': sum(seq_lengths)
+            'total_length': sum(seq_lengths),
+            'ids': list(sequences.keys())  # NOVO: para popular o Outgroup
         }
         
         return len(issues) == 0, issues, stats
@@ -142,7 +143,7 @@ def run_docker_command(container_name, command, log_callback, progress_callback=
     ]
     
     full_command = docker_base + [CONTAINERS[container_name]] + command
-    log_callback.emit(f"\n🔧 Executing: {' '.join(full_command)}", 'highlight')
+    log_callback.emit(f"\nExecuting: {' '.join(full_command)}", 'highlight')
     
     try:
         process = subprocess.Popen(
@@ -163,7 +164,7 @@ def run_docker_command(container_name, command, log_callback, progress_callback=
                 stdout_lines.append(output.strip())
                 log_callback.emit(output.strip(), 'default')
                 if progress_callback:
-                    progress_callback.emit(5)  # Increment progress
+                    progress_callback.emit(5)
         
         stderr_output = process.stderr.read()
         if stderr_output:
@@ -172,16 +173,16 @@ def run_docker_command(container_name, command, log_callback, progress_callback=
         returncode = process.poll()
         
         if returncode != 0:
-            log_callback.emit(f" ERROR: Command failed with code {returncode}", 'error')
+            log_callback.emit(f"ERROR: Command failed with code {returncode}", 'error')
             if stderr_output:
                 log_callback.emit(f"STDERR:\n{stderr_output}", 'error')
             raise subprocess.CalledProcessError(returncode, full_command, stderr=stderr_output)
         
-        log_callback.emit(" Command completed successfully!", 'success')
+        log_callback.emit("Command completed successfully!", 'success')
         return True
         
     except Exception as e:
-        log_callback.emit(f" DOCKER ERROR: {e}", 'error')
+        log_callback.emit(f"DOCKER ERROR: {e}", 'error')
         raise
 
 # ==============================================================================
@@ -223,7 +224,7 @@ class PhylogenyWorker(QObject):
             # ==================================================================
             self.stage_update.emit("Alignment (MAFFT)")
             self.progress_update.emit(10)
-            self.log_message.emit(f"\n [STEP 1/4] Aligning '{input_file_name}' with MAFFT...", 'default')
+            self.log_message.emit(f"\n[STEP 1/4] Aligning '{input_file_name}' with MAFFT...", 'default')
             
             mafft_strategy = self.params.get('mafft_strategy', 'auto')
             mafft_cmd = ['sh', '-c', f"mafft --{mafft_strategy} /data/{input_file_name} > /data/{aligned_file}"]
@@ -233,10 +234,10 @@ class PhylogenyWorker(QObject):
             # Analyze alignment
             alignment_stats = analyze_alignment(aligned_file)
             if alignment_stats:
-                self.log_message.emit(f"\n Alignment Quality:", 'highlight')
-                self.log_message.emit(f"  • Length: {alignment_stats['alignment_length']} bp", 'default')
-                self.log_message.emit(f"  • Gap %: {alignment_stats['gap_percentage']:.2f}%", 'default')
-                self.log_message.emit(f"  • Avg Identity: {alignment_stats['avg_identity']:.2f}%", 'default')
+                self.log_message.emit(f"\nAlignment Quality:", 'highlight')
+                self.log_message.emit(f"  Length: {alignment_stats['alignment_length']} bp", 'default')
+                self.log_message.emit(f"  Gap %: {alignment_stats['gap_percentage']:.2f}%", 'default')
+                self.log_message.emit(f"  Avg Identity: {alignment_stats['avg_identity']:.2f}%", 'default')
                 results['alignment_stats'] = alignment_stats
             
             # ==================================================================
@@ -244,7 +245,7 @@ class PhylogenyWorker(QObject):
             # ==================================================================
             self.stage_update.emit("Trimming (trimAl)")
             self.progress_update.emit(40)
-            self.log_message.emit(f"\n [STEP 2/4] Filtering alignment with trimAl...", 'default')
+            self.log_message.emit(f"\n[STEP 2/4] Filtering alignment with trimAl...", 'default')
             
             trimal_method = self.params.get('trimal_method', 'automated1')
             trimal_cmd = ['trimal', '-in', f'/data/{aligned_file}', '-out', f'/data/{trimmed_file}', f'-{trimal_method}']
@@ -256,7 +257,7 @@ class PhylogenyWorker(QObject):
             # ==================================================================
             self.stage_update.emit("Tree Construction")
             self.progress_update.emit(70)
-            self.log_message.emit(f"\n [STEP 3/4] Building phylogenetic tree (Method {self.choice})...", 'default')
+            self.log_message.emit(f"\n[STEP 3/4] Building phylogenetic tree (Method {self.choice})...", 'default')
             
             if self.choice == '1':
                 # Neighbor-Joining
@@ -289,11 +290,27 @@ Phylo.draw_ascii(tree)
                 results['tree_file'] = nj_output_file
                 
             elif self.choice == '2':
-                # Maximum Likelihood
+                # Maximum Likelihood com UFBoot e Outgroup
                 bootstrap = self.params.get('iqtree_bootstrap', 1000)
                 model = self.params.get('iqtree_model', 'MFP')
+                use_ufboot = self.params.get('use_ufboot', False)
+                outgroup = self.params.get('outgroup', "Unrooted (Default)")
                 
-                iqtree_cmd = ['iqtree', '-s', f'/data/{trimmed_file}', '-m', model, '-B', str(bootstrap)]
+                # Comando base
+                iqtree_cmd = ['iqtree', '-s', f'/data/{trimmed_file}', '-m', model]
+                
+                # Configurar Bootstrap (UltraFast ou Standard)
+                if use_ufboot:
+                    iqtree_cmd.extend(['-bb', str(bootstrap)])
+                    self.log_message.emit("Using UltraFast Bootstrap (100x faster)", 'highlight')
+                else:
+                    iqtree_cmd.extend(['-B', str(bootstrap)])
+                
+                # Configurar Outgroup
+                if outgroup and outgroup != "Unrooted (Default)":
+                    iqtree_cmd.extend(['-o', outgroup])
+                    self.log_message.emit(f"Rooting tree with outgroup: {outgroup}", 'highlight')
+                
                 run_docker_command("iqtree", iqtree_cmd, self.log_message, self.progress_increment)
                 tree_file = f"{trimmed_file}.treefile"
                 results['output_files'].append(tree_file)
@@ -332,23 +349,21 @@ end;
                 results['tree_file'] = tree_file
 
             # ==================================================================
-            # STEP 4: PLOTTING (NOVO)
+            # STEP 4: PLOTTING
             # ==================================================================
             if results['tree_file']:
                 self.stage_update.emit("Generating Plots (R)")
                 self.progress_update.emit(90)
-                self.log_message.emit(f"\n [STEP 4/4] Generating tree visualizations with R...", 'highlight')
+                self.log_message.emit(f"\n[STEP 4/4] Generating tree visualizations with R...", 'highlight')
                 
-                # Executa o container R passando o arquivo da árvore
                 plot_cmd = [results['tree_file']]
                 run_docker_command("cladegene_plot", plot_cmd, self.log_message)
                 
-                # Verifica visualmente se os plots foram criados para informar no log
                 plots_dir = Path("plots")
                 if plots_dir.exists():
                     plots_count = len(list(plots_dir.glob("tree_*.png")))
                     if plots_count > 0:
-                        self.log_message.emit(f" Successfully generated {plots_count} plots in ./plots/", 'success')
+                        self.log_message.emit(f"Successfully generated {plots_count} plots in ./plots/", 'success')
             
             # Finalização
             self.progress_update.emit(100)
@@ -358,11 +373,11 @@ end;
             results['execution_time'] = execution_time
             results['success'] = True
             
-            self.log_message.emit(f"\n  Total execution time: {execution_time:.2f} seconds", 'success')
+            self.log_message.emit(f"\nTotal execution time: {execution_time:.2f} seconds", 'success')
             self.finished.emit(True, results)
             
         except Exception as e:
-            self.log_message.emit(f"\n Pipeline failed: {str(e)}", 'error')
+            self.log_message.emit(f"\nPipeline failed: {str(e)}", 'error')
             self.finished.emit(False, results)
 
 # ==============================================================================
@@ -372,7 +387,7 @@ end;
 class PhylogenyApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CladoGene 🧬")
+        self.setWindowTitle("CladeGene")
         self.setGeometry(100, 100, 1200, 800)
         
         self.thread = None
@@ -396,7 +411,7 @@ class PhylogenyApp(QWidget):
         """Save execution to history."""
         self.history.append(entry)
         with open(HISTORY_FILE, 'w') as f:
-            json.dump(self.history[-50:], f, indent=2)  # Keep last 50
+            json.dump(self.history[-50:], f, indent=2)
     
     def apply_stylesheet(self):
         """Enhanced dark blue/white theme."""
@@ -491,9 +506,9 @@ class PhylogenyApp(QWidget):
         
         # Tabs
         tabs = QTabWidget()
-        tabs.addTab(self.create_pipeline_tab(), " Pipeline")
-        tabs.addTab(self.create_parameters_tab(), "⚙️ Parameters")
-        tabs.addTab(self.create_history_tab(), " History")
+        tabs.addTab(self.create_pipeline_tab(), "Pipeline")
+        tabs.addTab(self.create_parameters_tab(), "Parameters")
+        tabs.addTab(self.create_history_tab(), "History")
         main_layout.addWidget(tabs)
         
     def create_pipeline_tab(self):
@@ -510,7 +525,7 @@ class PhylogenyApp(QWidget):
         left_layout.setContentsMargins(0, 0, 5, 0)
         
         # Input Section
-        input_group = QGroupBox(" Input File")
+        input_group = QGroupBox("INPUT FILE")
         input_layout = QVBoxLayout(input_group)
         
         file_layout = QHBoxLayout()
@@ -520,7 +535,7 @@ class PhylogenyApp(QWidget):
         file_layout.addWidget(QLabel("FASTA:"))
         file_layout.addWidget(self.input_line)
         
-        browse_btn = QPushButton(" Browse")
+        browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(self.select_file)
         file_layout.addWidget(browse_btn)
         input_layout.addLayout(file_layout)
@@ -530,19 +545,19 @@ class PhylogenyApp(QWidget):
         self.preview_text.setReadOnly(True)
         self.preview_text.setMaximumHeight(100)
         self.preview_text.setPlaceholderText("File statistics will appear here...")
-        input_layout.addWidget(QLabel(" File Preview:"))
+        input_layout.addWidget(QLabel("File Preview:"))
         input_layout.addWidget(self.preview_text)
         
         left_layout.addWidget(input_group)
         
         # Method Selection
-        method_group = QGroupBox(" Phylogenetic Method")
+        method_group = QGroupBox("Phylogenetic Method")
         method_layout = QVBoxLayout(method_group)
         
         self.radio_group = QButtonGroup()
-        self.radio_nj = QRadioButton(" Neighbor-Joining")
-        self.radio_ml = QRadioButton(" Maximum Likelihood")
-        self.radio_bi = QRadioButton(" Bayesian Inference")
+        self.radio_nj = QRadioButton("Neighbor-Joining")
+        self.radio_ml = QRadioButton("Maximum Likelihood")
+        self.radio_bi = QRadioButton("Bayesian Inference")
         
         self.radio_ml.setChecked(True)
         
@@ -559,13 +574,13 @@ class PhylogenyApp(QWidget):
         # Control Section
         control_layout = QHBoxLayout()
         
-        self.start_button = QPushButton(" RUN ANALYSIS")
+        self.start_button = QPushButton("RUN ANALYSIS")
         self.start_button.setMinimumHeight(50)
         self.start_button.setFont(QFont('Arial', 12, QFont.Bold))
         self.start_button.clicked.connect(self.start_pipeline)
         control_layout.addWidget(self.start_button)
         
-        self.stop_button = QPushButton(" STOP")
+        self.stop_button = QPushButton("STOP")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_pipeline)
         control_layout.addWidget(self.stop_button)
@@ -573,7 +588,7 @@ class PhylogenyApp(QWidget):
         left_layout.addLayout(control_layout)
         
         # Progress Section
-        progress_group = QGroupBox(" Progress")
+        progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout(progress_group)
         
         self.stage_label = QLabel("Ready to start...")
@@ -586,59 +601,52 @@ class PhylogenyApp(QWidget):
         progress_layout.addWidget(self.progress_bar)
         
         left_layout.addWidget(progress_group)
-        left_layout.addStretch()  # Push logo to bottom
+        left_layout.addStretch()
         
-        # Logo Section at bottom - CladeGene logo
-        logo_frame = QFrame()
-        logo_frame.setStyleSheet("""
-            QFrame {
-                background-color: white;
-                border: 1px solid #E0E0E0;
-                border-radius: 5px;
-                padding: 15px;
-                min-height: 120px;
-            }
-        """)
-        logo_layout = QVBoxLayout(logo_frame)
+        # Logo Section
+        logo_container = QWidget()
+        logo_container.setStyleSheet("background-color: transparent;")
+        logo_layout = QHBoxLayout(logo_container)
         logo_layout.setAlignment(Qt.AlignCenter)
-        logo_layout.setContentsMargins(10, 10, 10, 10)
-        
-        # Load CladeGene logo from figures folder
-        logo_path = Path(__file__).parent / "figures" / "CladeGene.png"
+        logo_layout.setContentsMargins(20, 20, 20, 20)
+        logo_layout.setSpacing(25)
         
         from PySide6.QtGui import QPixmap
-        if logo_path.exists():
-            logo_label = QLabel()
-            pixmap = QPixmap(str(logo_path))
-            # Scale to fit the frame width (approximately 80% of left panel)
-            target_width = 280
-            scaled_pixmap = pixmap.scaledToWidth(target_width, Qt.SmoothTransformation)
-            logo_label.setPixmap(scaled_pixmap)
-            logo_label.setAlignment(Qt.AlignCenter)
-            logo_layout.addWidget(logo_label)
-        else:
-            # Fallback if logo not found
-            fallback = QLabel("CladeGene")
-            fallback.setAlignment(Qt.AlignCenter)
-            fallback.setStyleSheet("color: #1F456E; font-size: 16pt; font-weight: bold;")
-            logo_layout.addWidget(fallback)
         
-        left_layout.addWidget(logo_frame)
+        logos = [
+            ("cladegene.png", 150),
+            ("Brasao UFPA Versao Corel 9.png", 120),
+            ("EngBio logo.png", 90)
+        ]
+        
+        figures_dir = Path(__file__).parent / "figures"
+        
+        for logo_file, target_height in logos:
+            logo_path = figures_dir / logo_file
+            
+            if logo_path.exists():
+                logo_label = QLabel()
+                logo_label.setStyleSheet("background-color: transparent; border: none;")
+                pixmap = QPixmap(str(logo_path))
+                scaled_pixmap = pixmap.scaledToHeight(target_height, Qt.SmoothTransformation)
+                logo_label.setPixmap(scaled_pixmap)
+                logo_label.setAlignment(Qt.AlignCenter)
+                logo_layout.addWidget(logo_label)
+        
+        left_layout.addWidget(logo_container)
         
         # ========== RIGHT SIDE: Log ==========
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(5, 0, 0, 0)
         
-        log_group = QGroupBox(" Execution Log")
+        log_group = QGroupBox("Execution Log")
         log_layout = QVBoxLayout(log_group)
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.set_log_colors()
         log_layout.addWidget(self.log_text)
-        
-        # Removido: Botão de plotagem manual
         
         right_layout.addWidget(log_group)
         
@@ -648,8 +656,8 @@ class PhylogenyApp(QWidget):
         
         # Set initial sizes (40% left, 60% right)
         splitter.setSizes([400, 600])
-        splitter.setStretchFactor(0, 2)  # Left side less stretchable
-        splitter.setStretchFactor(1, 3)  # Right side more stretchable
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
         
         main_layout.addWidget(splitter)
         
@@ -698,7 +706,21 @@ class PhylogenyApp(QWidget):
         iqtree_model_h = QHBoxLayout()
         iqtree_model_h.addWidget(QLabel("Model:"))
         self.iqtree_model = QComboBox()
-        self.iqtree_model.addItems(['MFP', 'GTR+G', 'HKY+G', 'JC'])
+        
+        # Modelos atualizados conforme o artigo
+        models = [
+            'MFP',          # ModelFinder Plus (Recomendado)
+            'GTR+I+G',      # Matriz completa (D270) e ndhF
+            'TVM+I+G',      # matK e rbcL
+            'GTR+G',        # rps16 e trnL-F
+            'HKY+I+G',      
+            'K2P+G',        
+            'TIM+I+G',      
+            'SYM+I+G'       
+        ]
+        
+        self.iqtree_model.addItems(models)
+        self.iqtree_model.setToolTip("MFP: Automatic detection\n+I: Invariant sites\n+G: Gamma rate heterogeneity")
         iqtree_model_h.addWidget(self.iqtree_model)
         iqtree_layout.addLayout(iqtree_model_h)
         
@@ -736,12 +758,32 @@ class PhylogenyApp(QWidget):
         
         scroll_layout.addWidget(mrbayes_group)
         
+        # Advanced Options
+        adv_group = QGroupBox("Advanced Options")
+        adv_layout = QVBoxLayout(adv_group)
+        
+        # Outgroup Selection
+        outgroup_h = QHBoxLayout()
+        outgroup_h.addWidget(QLabel("Outgroup (Root):"))
+        self.outgroup_combo = QComboBox()
+        self.outgroup_combo.addItem("Unrooted (Default)")
+        outgroup_h.addWidget(self.outgroup_combo)
+        adv_layout.addLayout(outgroup_h)
+        
+        # UltraFast Bootstrap Checkbox
+        self.ufboot_check = QCheckBox("Use UltraFast Bootstrap (IQ-TREE)")
+        self.ufboot_check.setChecked(True)
+        self.ufboot_check.setToolTip("Much faster and robust than standard bootstrap (-bb)")
+        adv_layout.addWidget(self.ufboot_check)
+        
+        scroll_layout.addWidget(adv_group)
+        
         scroll_layout.addStretch()
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
         
         # Reset button
-        reset_btn = QPushButton(" Reset to Defaults")
+        reset_btn = QPushButton("Reset to Defaults")
         reset_btn.clicked.connect(self.reset_parameters)
         layout.addWidget(reset_btn)
         
@@ -752,7 +794,7 @@ class PhylogenyApp(QWidget):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        layout.addWidget(QLabel(" Recent Executions:"))
+        layout.addWidget(QLabel("Recent Executions:"))
         
         self.history_table = QTableWidget()
         self.history_table.setColumnCount(5)
@@ -762,7 +804,7 @@ class PhylogenyApp(QWidget):
         
         self.update_history_table()
         
-        clear_btn = QPushButton(" Clear History")
+        clear_btn = QPushButton("Clear History")
         clear_btn.clicked.connect(self.clear_history)
         layout.addWidget(clear_btn)
         
@@ -776,7 +818,7 @@ class PhylogenyApp(QWidget):
             self.history_table.setItem(i, 1, QTableWidgetItem(entry.get('file', 'N/A')))
             self.history_table.setItem(i, 2, QTableWidgetItem(entry.get('method', 'N/A')))
             self.history_table.setItem(i, 3, QTableWidgetItem(f"{entry.get('time', 0):.2f}"))
-            self.history_table.setItem(i, 4, QTableWidgetItem('correct' if entry.get('success') else 'error'))
+            self.history_table.setItem(i, 4, QTableWidgetItem('Success' if entry.get('success') else 'Failed'))
     
     def clear_history(self):
         """Clear execution history."""
@@ -812,6 +854,8 @@ class PhylogenyApp(QWidget):
         self.iqtree_bootstrap.setValue(1000)
         self.mrbayes_ngen.setValue(100000)
         self.mrbayes_nchains.setValue(4)
+        self.ufboot_check.setChecked(True)
+        self.outgroup_combo.setCurrentIndex(0)
         QMessageBox.information(self, "Reset", "Parameters reset to defaults!")
     
     def select_file(self):
@@ -824,24 +868,31 @@ class PhylogenyApp(QWidget):
         if filepath:
             os.chdir(Path(filepath).parent)
             self.input_line.setText(Path(filepath).name)
-            self.log(f" File selected: {Path(filepath).name}", 'highlight')
+            self.log(f"File selected: {Path(filepath).name}", 'highlight')
             
             # Validate and show preview
             valid, issues, stats = validate_fasta(filepath)
             
             preview_text = ""
             if valid:
-                preview_text = f" Valid FASTA file\n"
-                preview_text += f" Sequences: {stats['num_sequences']}\n"
-                preview_text += f" Length range: {stats['min_length']}-{stats['max_length']} bp\n"
-                preview_text += f" Average length: {stats['avg_length']:.1f} bp\n"
-                preview_text += f" Total size: {stats['total_length']:,} bp"
+                preview_text = f"Valid FASTA file\n"
+                preview_text += f"Sequences: {stats['num_sequences']}\n"
+                preview_text += f"Length range: {stats['min_length']}-{stats['max_length']} bp\n"
+                preview_text += f"Average length: {stats['avg_length']:.1f} bp\n"
+                preview_text += f"Total size: {stats['total_length']:,} bp"
             else:
-                preview_text = " VALIDATION ISSUES:\n"
+                preview_text = "VALIDATION ISSUES:\n"
                 for issue in issues:
-                    preview_text += f"  • {issue}\n"
+                    preview_text += f"  {issue}\n"
             
             self.preview_text.setPlainText(preview_text)
+            
+            # Popular Outgroup combo
+            self.outgroup_combo.clear()
+            self.outgroup_combo.addItem("Unrooted (Default)")
+            if 'ids' in stats:
+                for seq_id in sorted(stats['ids']):
+                    self.outgroup_combo.addItem(seq_id)
             
             if not valid:
                 QMessageBox.warning(self, "Validation Warning", 
@@ -873,7 +924,9 @@ class PhylogenyApp(QWidget):
             'iqtree_model': self.iqtree_model.currentText(),
             'iqtree_bootstrap': self.iqtree_bootstrap.value(),
             'mrbayes_ngen': self.mrbayes_ngen.value(),
-            'mrbayes_nchains': self.mrbayes_nchains.value()
+            'mrbayes_nchains': self.mrbayes_nchains.value(),
+            'outgroup': self.outgroup_combo.currentText(),
+            'use_ufboot': self.ufboot_check.isChecked()
         }
     
     def toggle_interface(self, enable):
@@ -884,10 +937,6 @@ class PhylogenyApp(QWidget):
         self.radio_ml.setEnabled(enable)
         self.radio_bi.setEnabled(enable)
         self.input_line.setReadOnly(not enable)
-        
-        browse_btn = self.findChild(QPushButton, "📁 Browse")
-        if browse_btn:
-            browse_btn.setEnabled(enable)
     
     def stop_pipeline(self):
         """Stop running pipeline."""
@@ -899,7 +948,7 @@ class PhylogenyApp(QWidget):
             )
             
             if reply == QMessageBox.Yes:
-                self.log(" Stopping pipeline...", 'error')
+                self.log("Stopping pipeline...", 'error')
                 self.thread.terminate()
                 self.thread.wait()
                 self.toggle_interface(True)
@@ -907,7 +956,7 @@ class PhylogenyApp(QWidget):
                 self.stage_label.setText("Stopped by user")
     
     def start_pipeline(self):
-        #Start the phylogenetic pipeline.
+        """Start the phylogenetic pipeline."""
         input_file_name = self.input_line.text()
         
         if not input_file_name:
@@ -931,12 +980,12 @@ class PhylogenyApp(QWidget):
         
         self.log_text.clear()
         self.log("="*60, 'default')
-        self.log("🧬 CladoGene - Analysis Started", 'highlight')
+        self.log("CladeGene - Analysis Started", 'highlight')
         self.log("="*60, 'default')
-        self.log(f"📁 Input: {input_file_name}", 'default')
-        self.log(f" Method: {method_names[choice]}", 'default')
-        self.log(f"  Parameters: {params}", 'default')
-        self.log(f" Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 'default')
+        self.log(f"Input: {input_file_name}", 'default')
+        self.log(f"Method: {method_names[choice]}", 'default')
+        self.log(f"Parameters: {params}", 'default')
+        self.log(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 'default')
         self.log("="*60, 'default')
         
         self.toggle_interface(False)
@@ -967,22 +1016,22 @@ class PhylogenyApp(QWidget):
         
         if success:
             self.log("="*60, 'success')
-            self.log("✅ ANALYSIS COMPLETED SUCCESSFULLY!", 'success')
+            self.log("ANALYSIS COMPLETED SUCCESSFULLY!", 'success')
             self.log("="*60, 'success')
             
             if results.get('alignment_stats'):
                 stats = results['alignment_stats']
-                self.log(f"\n Final Alignment Statistics:", 'highlight')
-                self.log(f"  • Length: {stats.get('alignment_length', 'N/A')} bp", 'default')
-                self.log(f"  • Gap percentage: {stats.get('gap_percentage', 0):.2f}%", 'default')
-                self.log(f"  • Average identity: {stats.get('avg_identity', 0):.2f}%", 'default')
+                self.log(f"\nFinal Alignment Statistics:", 'highlight')
+                self.log(f"  Length: {stats.get('alignment_length', 'N/A')} bp", 'default')
+                self.log(f"  Gap percentage: {stats.get('gap_percentage', 0):.2f}%", 'default')
+                self.log(f"  Average identity: {stats.get('avg_identity', 0):.2f}%", 'default')
             
             if results.get('output_files'):
-                self.log(f"\n Output files:", 'highlight')
+                self.log(f"\nOutput files:", 'highlight')
                 for f in results['output_files']:
-                    self.log(f"  • {f}", 'default')
+                    self.log(f"  {f}", 'default')
             
-            self.log(f"\n Total time: {results.get('execution_time', 0):.2f} seconds", 'success')
+            self.log(f"\nTotal time: {results.get('execution_time', 0):.2f} seconds", 'success')
             
             # Save to history
             history_entry = {
@@ -995,13 +1044,13 @@ class PhylogenyApp(QWidget):
             self.save_history(history_entry)
             self.update_history_table()
             
-            QMessageBox.information(self, "Success ", 
+            QMessageBox.information(self, "Success", 
                                   f"Phylogenetic analysis completed!\n\n"
                                   f"Time: {results.get('execution_time', 0):.2f}s\n"
                                   f"Output: {len(results.get('output_files', []))} file(s)")
         else:
             self.log("="*60, 'error')
-            self.log(" ANALYSIS FAILED", 'error')
+            self.log("ANALYSIS FAILED", 'error')
             self.log("="*60, 'error')
             
             history_entry = {
@@ -1014,11 +1063,11 @@ class PhylogenyApp(QWidget):
             self.save_history(history_entry)
             self.update_history_table()
             
-            QMessageBox.critical(self, "Error ",
+            QMessageBox.critical(self, "Error",
                                "Pipeline failed. Check the log for details.")
         
         self.progress_bar.setValue(100 if success else 0)
-        self.stage_label.setText(" Completed" if success else " Failed")
+        self.stage_label.setText("Completed" if success else "Failed")
 
 # ==============================================================================
 # --- 4. MAIN EXECUTION ---
@@ -1028,7 +1077,7 @@ if __name__ == "__main__":
     os.chdir(Path(__file__).parent)
     
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')  # Modern cross-platform style
+    app.setStyle('Fusion')
     
     window = PhylogenyApp()
     window.show()

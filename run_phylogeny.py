@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""
-Phylo-Pipe Pro - Command Line Interface
-Advanced phylogenetic analysis pipeline with Docker containers
-"""
+
+# Phylo-Pipe Pro - Command Line Interface
+# Advanced phylogenetic analysis pipeline with Docker containers
 
 import os
 import sys
@@ -13,9 +12,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Tuple
 
-# ==============================================================================
 # CONFIGURATION
-# ==============================================================================
 
 CONTAINERS = {
     "mafft": "quay.io/biocontainers/mafft:7.525--h031d066_0",
@@ -37,15 +34,10 @@ class Colors:
     UNDERLINE = '\033[4m'
     END = '\033[0m'
 
-# ==============================================================================
 # VALIDATION FUNCTIONS
-# ==============================================================================
 
 def validate_fasta(filepath: Path) -> Tuple[bool, List[str], Dict]:
-    """
-    Validate FASTA file format and content.
-    Returns: (is_valid, issues_list, statistics_dict)
-    """
+
     issues = []
     sequences = {}
     
@@ -70,7 +62,6 @@ def validate_fasta(filepath: Path) -> Tuple[bool, List[str], Dict]:
                         issues.append(f"Line {line_num}: Duplicate ID '{current_id}'")
                     current_seq = []
                 else:
-                    # Validate characters
                     invalid_chars = set(line.upper()) - set('ACGTRYSWKMBDHVN-')
                     if invalid_chars:
                         issues.append(
@@ -79,7 +70,6 @@ def validate_fasta(filepath: Path) -> Tuple[bool, List[str], Dict]:
                         )
                     current_seq.append(line.upper())
             
-            # Add last sequence
             if current_id:
                 sequences[current_id] = ''.join(current_seq)
         
@@ -115,7 +105,6 @@ def validate_fasta(filepath: Path) -> Tuple[bool, List[str], Dict]:
         return False, [f"Error reading file: {str(e)}"], {}
 
 def analyze_alignment(filepath: Path) -> Dict:
-    """Analyze alignment quality metrics."""
     try:
         sequences = {}
         with open(filepath, 'r') as f:
@@ -235,14 +224,10 @@ def run_docker_command(container_name: str, command: List[str], verbose: bool = 
         print(f"{Colors.RED} Docker execution error: {e}{Colors.END}")
         return False
 
-# ==============================================================================
 # PIPELINE STAGES
-# ==============================================================================
 
 def stage_alignment(input_file: Path, strategy: str = 'auto', verbose: bool = True) -> Path:
-    """Stage 1: Multiple sequence alignment with MAFFT."""
     aligned_file = input_file.with_suffix('').with_suffix('.aligned.fasta')
-    
     print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
     print(f"{Colors.HEADER}{Colors.BOLD}STAGE 1: MULTIPLE SEQUENCE ALIGNMENT{Colors.END}")
     print(f"{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
@@ -268,9 +253,7 @@ def stage_alignment(input_file: Path, strategy: str = 'auto', verbose: bool = Tr
     return aligned_file
 
 def stage_trimming(aligned_file: Path, method: str = 'automated1', verbose: bool = True) -> Path:
-    """Stage 2: Alignment trimming with trimAl."""
-    trimmed_file = aligned_file.with_suffix('').with_suffix('.trimmed.fasta')
-    
+    trimmed_file = aligned_file.with_suffix('').with_suffix('.trimmed.fasta')    
     print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
     print(f"{Colors.HEADER}{Colors.BOLD}STAGE 2: ALIGNMENT TRIMMING{Colors.END}")
     print(f"{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
@@ -300,9 +283,7 @@ def stage_trimming(aligned_file: Path, method: str = 'automated1', verbose: bool
     return trimmed_file
 
 def stage_tree_nj(trimmed_file: Path, verbose: bool = True) -> Path:
-    """Stage 3A: Neighbor-Joining tree construction."""
-    output_file = trimmed_file.with_suffix('').with_suffix('.nj_tree.newick')
-    
+    output_file = trimmed_file.with_suffix('').with_suffix('.nj_tree.newick')    
     print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
     print(f"{Colors.HEADER}{Colors.BOLD}STAGE 3: TREE CONSTRUCTION - NEIGHBOR-JOINING{Colors.END}")
     print(f"{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
@@ -349,9 +330,7 @@ Phylo.draw_ascii(tree)
 
 def stage_tree_ml(trimmed_file: Path, model: str = 'MFP', bootstrap: int = 1000, 
                   verbose: bool = True) -> Path:
-    """Stage 3B: Maximum Likelihood tree with IQ-TREE."""
-    output_file = trimmed_file.with_suffix('.treefile')
-    
+    output_file = trimmed_file.with_suffix('.treefile')    
     print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
     print(f"{Colors.HEADER}{Colors.BOLD}STAGE 3: TREE CONSTRUCTION - MAXIMUM LIKELIHOOD{Colors.END}")
     print(f"{Colors.HEADER}{Colors.BOLD}{'='*60}{Colors.END}")
@@ -376,7 +355,6 @@ def stage_tree_ml(trimmed_file: Path, model: str = 'MFP', bootstrap: int = 1000,
 
 def stage_tree_bayesian(trimmed_file: Path, ngen: int = 100000, nchains: int = 4,
                        verbose: bool = True) -> Path:
-    """Stage 3C: Bayesian Inference with MrBayes."""
     nexus_file = trimmed_file.with_suffix('.nex')
     output_file = Path(str(nexus_file) + '.con.tre')
     
@@ -402,7 +380,7 @@ def stage_tree_bayesian(trimmed_file: Path, ngen: int = 100000, nchains: int = 4
         raise RuntimeError("FASTA to NEXUS conversion failed")
     
     # Add MrBayes commands
-    burnin = int(ngen * 0.25 / 100)  # 25% burnin
+    burnin = int(ngen * 0.25 / 100)  
     
     mrbayes_block = f"""
 begin mrbayes;
@@ -435,15 +413,10 @@ end;
     print(f"\n{Colors.GREEN} Bayesian consensus tree saved to: {output_file}{Colors.END}")
     return output_file
 
-# ==============================================================================
 # MAIN PIPELINE
-# ==============================================================================
 
 def run_pipeline(input_file: Path, method: str, params: Dict, verbose: bool = True):
-    """Run complete phylogenetic analysis pipeline."""
-    
-    start_time = datetime.now()
-    
+    start_time = datetime.now()    
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*70}{Colors.END}")
     print(f"{Colors.BOLD}{Colors.HEADER} PHYLO-PIPE - PHYLOGENETIC ANALYSIS{Colors.END}")
     print(f"{Colors.BOLD}{Colors.HEADER}{'='*70}{Colors.END}")
@@ -455,7 +428,6 @@ def run_pipeline(input_file: Path, method: str, params: Dict, verbose: bool = Tr
     # Validate input
     print(f"\n{Colors.CYAN} Validating input file...{Colors.END}")
     valid, issues, stats = validate_fasta(input_file)
-    
     if issues:
         print(f"\n{Colors.YELLOW}  Validation issues found:{Colors.END}")
         for issue in issues:
@@ -528,9 +500,7 @@ def run_pipeline(input_file: Path, method: str, params: Dict, verbose: bool = Tr
         print(f"{Colors.RED}Error: {str(e)}{Colors.END}\n")
         return False
 
-# ==============================================================================
 # CLI INTERFACE
-# ==============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
