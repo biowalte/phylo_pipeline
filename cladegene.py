@@ -12,14 +12,13 @@ from PySide6.QtWidgets import (
     QPushButton, QRadioButton, QGroupBox, QTextEdit, QFileDialog, 
     QMessageBox, QButtonGroup, QProgressBar, QTabWidget, QSpinBox,
     QDoubleSpinBox, QCheckBox, QTableWidget, QTableWidgetItem, QComboBox,
-    QScrollArea, QFrame, QSplitter
+    QScrollArea, QFrame, QSplitter, QListWidget, QListWidgetItem,
+    QInputDialog  # <--- ADICIONADO AQUI
 )
 from PySide6.QtCore import QThread, Signal, QObject, Qt, QTimer
 from PySide6.QtGui import QFont, QColor, QTextCharFormat, QTextCursor
 
-# ==============================================================================
-# --- 1. CONFIGURATION AND HELPER FUNCTIONS ---
-# ==============================================================================
+# 1. CONFIGURATION AND HELPER FUNCTIONS 
 
 CONTAINERS = {
     "mafft": "quay.io/biocontainers/mafft:7.525--h031d066_0",
@@ -77,7 +76,8 @@ def validate_fasta(filepath):
             'max_length': max(seq_lengths),
             'avg_length': sum(seq_lengths) / len(seq_lengths),
             'total_length': sum(seq_lengths),
-            'ids': list(sequences.keys())  # NOVO: para popular o Outgroup
+            'ids': list(sequences.keys()),
+            'sequences': sequences
         }
         
         return len(issues) == 0, issues, stats
@@ -131,6 +131,62 @@ def analyze_alignment(filepath):
         }
     except:
         return {}
+
+def concatenate_alignments(gene_files, output_file, partition_file):
+    """Concatenates multiple aligned FASTA files and creates partition file."""
+    from collections import defaultdict
+    
+    all_sequences = defaultdict(str)
+    partitions = []
+    current_pos = 1
+    
+    for gene_name, gene_file in gene_files:
+        # Read alignment
+        sequences = {}
+        with open(gene_file, 'r') as f:
+            current_id = None
+            current_seq = []
+            for line in f:
+                line = line.strip()
+                if line.startswith('>'):
+                    if current_id:
+                        sequences[current_id] = ''.join(current_seq)
+                    current_id = line[1:].split()[0]
+                    current_seq = []
+                elif line:
+                    current_seq.append(line)
+            if current_id:
+                sequences[current_id] = ''.join(current_seq)
+        
+        # Get alignment length
+        if sequences:
+            gene_length = len(list(sequences.values())[0])
+            
+            # Add sequences (fill with gaps if missing)
+            all_ids = set(all_sequences.keys()) | set(sequences.keys())
+            for seq_id in all_ids:
+                if seq_id in sequences:
+                    all_sequences[seq_id] += sequences[seq_id]
+                else:
+                    all_sequences[seq_id] += '-' * gene_length
+            
+            # Record partition
+            end_pos = current_pos + gene_length - 1
+            partitions.append(f"DNA, {gene_name} = {current_pos}-{end_pos}")
+            current_pos = end_pos + 1
+    
+    # Write concatenated alignment
+    with open(output_file, 'w') as f:
+        for seq_id, seq in all_sequences.items():
+            f.write(f">{seq_id}\n")
+            f.write(f"{seq}\n")
+    
+    # Write partition file
+    with open(partition_file, 'w') as f:
+        for partition in partitions:
+            f.write(partition + '\n')
+    
+    return len(all_sequences), sum(len(seq) for seq in all_sequences.values()) // len(all_sequences)
 
 # --- Docker Command Runner ---
 def run_docker_command(container_name, command, log_callback, progress_callback=None):
@@ -186,7 +242,7 @@ def run_docker_command(container_name, command, log_callback, progress_callback=
         raise
 
 # ==============================================================================
-# --- 2. WORKER (Pipeline Logic) ---
+# --- 2. WORKERS (Pipeline Logic) ---
 # ==============================================================================
 
 class PhylogenyWorker(QObject):
@@ -219,9 +275,7 @@ class PhylogenyWorker(QObject):
         }
         
         try:
-            # ==================================================================
             # STEP 1: ALIGNMENT
-            # ==================================================================
             self.stage_update.emit("Alignment (MAFFT)")
             self.progress_update.emit(10)
             self.log_message.emit(f"\n[STEP 1/4] Aligning '{input_file_name}' with MAFFT...", 'default')
@@ -240,9 +294,7 @@ class PhylogenyWorker(QObject):
                 self.log_message.emit(f"  Avg Identity: {alignment_stats['avg_identity']:.2f}%", 'default')
                 results['alignment_stats'] = alignment_stats
             
-            # ==================================================================
             # STEP 2: TRIMMING
-            # ==================================================================
             self.stage_update.emit("Trimming (trimAl)")
             self.progress_update.emit(40)
             self.log_message.emit(f"\n[STEP 2/4] Filtering alignment with trimAl...", 'default')
@@ -252,9 +304,7 @@ class PhylogenyWorker(QObject):
             run_docker_command("trimal", trimal_cmd, self.log_message, self.progress_increment)
             self.progress_update.emit(65)
             
-            # ==================================================================
             # STEP 3: TREE CONSTRUCTION
-            # ==================================================================
             self.stage_update.emit("Tree Construction")
             self.progress_update.emit(70)
             self.log_message.emit(f"\n[STEP 3/4] Building phylogenetic tree (Method {self.choice})...", 'default')
@@ -348,9 +398,7 @@ end;
                 results['output_files'].append(tree_file)
                 results['tree_file'] = tree_file
 
-            # ==================================================================
             # STEP 4: PLOTTING
-            # ==================================================================
             if results['tree_file']:
                 self.stage_update.emit("Generating Plots (R)")
                 self.progress_update.emit(90)
@@ -368,7 +416,6 @@ end;
             # Finalização
             self.progress_update.emit(100)
             
-            # Calculate execution time
             execution_time = (datetime.now() - self.start_time).total_seconds()
             results['execution_time'] = execution_time
             results['success'] = True
@@ -379,6 +426,209 @@ end;
         except Exception as e:
             self.log_message.emit(f"\nPipeline failed: {str(e)}", 'error')
             self.finished.emit(False, results)
+
+
+class MultilocusWorker(QObject):
+    """Worker for multilocus analysis."""
+    log_message = Signal(str, str)
+    progress_update = Signal(int)
+    stage_update = Signal(str)
+    finished = Signal(bool, dict)
+    
+    def __init__(self, gene_files, choice, params):
+        super().__init__()
+        self.gene_files = gene_files  # List of (gene_name, filepath)
+        self.choice = choice
+        self.params = params
+        self.start_time = None
+        
+    def run(self):
+        self.start_time = datetime.now()
+        
+        results = {
+            'success': False,
+            'output_files': [],
+            'execution_time': 0,
+            'tree_file': None
+        }
+        
+        try:
+            # STEP 1: Align each gene
+            self.stage_update.emit("Aligning genes")
+            self.progress_update.emit(5)
+            self.log_message.emit("\n[MULTILOCUS] Starting gene alignment...", 'highlight')
+            
+            aligned_genes = []
+            
+            # --- CORREÇÃO DE CAMINHO ---
+            work_dir = Path.cwd().resolve() 
+            # ---------------------------
+
+            for i, (gene_name, gene_file) in enumerate(self.gene_files):
+                progress = 5 + int((i / len(self.gene_files)) * 20)
+                self.progress_update.emit(progress)
+                
+                self.log_message.emit(f"\nAligning {gene_name}...", 'default')
+                
+                # Prepara caminhos relativos para o Docker
+                full_path = Path(gene_file).resolve()
+                try:
+                    rel_path = full_path.relative_to(work_dir)
+                    docker_input_path = f"/data/{rel_path.as_posix()}"
+                except ValueError:
+                    raise ValueError(f"O arquivo {gene_name} deve estar dentro da pasta do projeto!")
+
+                base_name = full_path.name
+                aligned_filename = f"{gene_name}.aligned.fasta" # Nome limpo
+                
+                mafft_strategy = self.params.get('mafft_strategy', 'auto')
+                
+                # Comando ajustado com caminho relativo
+                mafft_cmd = ['sh', '-c', f"mafft --{mafft_strategy} {docker_input_path} > /data/{aligned_filename}"]
+                run_docker_command("mafft", mafft_cmd, self.log_message)
+                
+                aligned_genes.append((gene_name, aligned_filename))
+            
+            # STEP 2: Trim each alignment
+            self.stage_update.emit("Trimming alignments")
+            self.progress_update.emit(25)
+            self.log_message.emit("\n[MULTILOCUS] Trimming alignments...", 'highlight')
+            
+            trimmed_genes = []
+            for i, (gene_name, aligned_file) in enumerate(aligned_genes):
+                progress = 25 + int((i / len(aligned_genes)) * 15)
+                self.progress_update.emit(progress)
+                
+                self.log_message.emit(f"\nTrimming {gene_name}...", 'default')
+                
+                # Como aligned_file foi criado por nós em /data, é só usar o nome
+                trimmed_file = f"{gene_name}.trimmed.fasta"
+                
+                trimal_method = self.params.get('trimal_method', 'automated1')
+                # Input e Output são apenas os nomes dos arquivos em /data
+                trimal_cmd = ['trimal', '-in', f'/data/{aligned_file}', '-out', f'/data/{trimmed_file}', f'-{trimal_method}']
+                run_docker_command("trimal", trimal_cmd, self.log_message)
+                
+                trimmed_genes.append((gene_name, trimmed_file))
+            
+            # STEP 3: Concatenate
+            self.stage_update.emit("Concatenating genes")
+            self.progress_update.emit(40)
+            self.log_message.emit("\n[MULTILOCUS] Concatenating alignments...", 'highlight')
+            
+            concat_file = "concatenated.fasta"
+            partition_file = "partitions.txt"
+            
+            # Precisamos passar os caminhos REAIS (no host) para a função python de concatenação
+            # trimmed_genes tem apenas nomes de arquivo. Vamos assumir que estão no work_dir (onde o docker salvou)
+            genes_with_paths = [(name, str(work_dir / f)) for name, f in trimmed_genes]
+            
+            num_seqs, total_length = concatenate_alignments(genes_with_paths, str(work_dir / concat_file), str(work_dir / partition_file))
+            
+            self.log_message.emit(f"\nConcatenated alignment created:", 'highlight')
+            self.log_message.emit(f"  Sequences: {num_seqs}", 'default')
+            self.log_message.emit(f"  Total length: {total_length} bp", 'default')
+            self.log_message.emit(f"  Partitions: {len(trimmed_genes)}", 'default')
+            
+            # STEP 4: Tree construction
+            self.stage_update.emit("Building tree")
+            self.progress_update.emit(50)
+            self.log_message.emit("\n[MULTILOCUS] Building phylogenetic tree...", 'highlight')
+            
+            if self.choice == '2':  # Maximum Likelihood
+                bootstrap = self.params.get('iqtree_bootstrap', 1000)
+                use_ufboot = self.params.get('use_ufboot', False)
+                outgroup = self.params.get('outgroup', "Unrooted (Default)")
+                
+                # Partitioned analysis
+                iqtree_cmd = ['iqtree', '-s', f'/data/{concat_file}', '-p', f'/data/{partition_file}']
+                
+                if use_ufboot:
+                    iqtree_cmd.extend(['-bb', str(bootstrap)])
+                else:
+                    iqtree_cmd.extend(['-B', str(bootstrap)])
+                
+                if outgroup and outgroup != "Unrooted (Default)":
+                    iqtree_cmd.extend(['-o', outgroup])
+                
+                run_docker_command("iqtree", iqtree_cmd, self.log_message)
+                tree_file = f"{concat_file}.treefile"
+                results['tree_file'] = tree_file
+                results['output_files'].append(tree_file)
+                
+            elif self.choice == '3':  # Bayesian
+                self.log_message.emit("\nPreparing Bayesian partitioned analysis...", 'highlight')
+                
+                # Convert FASTA to NEXUS
+                nexus_file = "concatenated.nex"
+                
+                biopython_convert_cmd = [
+                    'python', '-c',
+                    f"from Bio import AlignIO; AlignIO.convert('/data/{concat_file}', 'fasta', '/data/{nexus_file}', 'nexus', molecule_type='DNA')"
+                ]
+                run_docker_command("biopython", biopython_convert_cmd, self.log_message)
+                
+                # Read partitions (read from HOST file)
+                partitions = []
+                with open(work_dir / partition_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            parts = line.split('=')
+                            gene_name = parts[0].split(',')[1].strip()
+                            positions = parts[1].strip()
+                            start, end = positions.split('-')
+                            partitions.append((gene_name, int(start), int(end)))
+                
+                # Build MrBayes block
+                ngen = self.params.get('mrbayes_ngen', 100000)
+                nchains = self.params.get('mrbayes_nchains', 4)
+                burnin = int(ngen * 0.25 / 100)
+                
+                mrbayes_block = "begin mrbayes;\n"
+                mrbayes_block += "    set autoclose=yes nowarn=yes;\n\n"
+                mrbayes_block += "    [ Define partitions ]\n"
+                for gene_name, start, end in partitions:
+                    mrbayes_block += f"    charset {gene_name} = {start}-{end};\n"
+                
+                partition_names = [gene_name for gene_name, _, _ in partitions]
+                mrbayes_block += f"    partition genes = {len(partitions)}: {', '.join(partition_names)};\n"
+                mrbayes_block += "    set partition = genes;\n\n"
+                mrbayes_block += "    [ Set models for each partition ]\n"
+                for gene_name in partition_names:
+                    mrbayes_block += f"    applyto=({gene_name}) lset nst=6 rates=gamma;\n"
+                mrbayes_block += "\n"
+                mrbayes_block += f"    mcmc ngen={ngen} samplefreq=100 nchains={nchains} nruns=2;\n"
+                mrbayes_block += f"    sump burnin={burnin};\n"
+                mrbayes_block += f"    sumt burnin={burnin};\n"
+                mrbayes_block += "    quit;\nend;\n"
+                
+                with open(work_dir / nexus_file, 'a') as f:
+                    f.write("\n" + mrbayes_block)
+                
+                self.log_message.emit(f"\nRunning MrBayes with {len(partitions)} partitions...", 'highlight')
+                mrbayes_cmd = ['mb', f'/data/{nexus_file}']
+                run_docker_command("mrbayes", mrbayes_cmd, self.log_message)
+                
+                tree_file = f"{nexus_file}.con.tre"
+                results['tree_file'] = tree_file
+                results['output_files'].append(tree_file)
+            
+            else:
+                raise ValueError("Choose ML or Bayesian for multilocus")
+            
+            self.progress_update.emit(100)
+            execution_time = (datetime.now() - self.start_time).total_seconds()
+            results['execution_time'] = execution_time
+            results['success'] = True
+            
+            self.log_message.emit(f"\nMultilocus analysis completed in {execution_time:.2f} seconds", 'success')
+            self.finished.emit(True, results)
+            
+        except Exception as e:
+            self.log_message.emit(f"\nMultilocus pipeline failed: {str(e)}", 'error')
+            self.finished.emit(False, results)
+
 
 # ==============================================================================
 # --- 3. MAIN APPLICATION ---
@@ -393,6 +643,7 @@ class PhylogenyApp(QWidget):
         self.thread = None
         self.worker = None
         self.history = self.load_history()
+        self.gene_list = []  # Para multilocus
         
         self.setup_ui()
         self.apply_stylesheet()
@@ -465,6 +716,11 @@ class PhylogenyApp(QWidget):
             font-family: 'Courier New', monospace;
             font-size: 9pt;
         }
+        QListWidget {
+            background-color: white;
+            border: 1px solid #BDC3C7;
+            border-radius: 4px;
+        }
         QProgressBar {
             border: 1px solid #BDC3C7;
             border-radius: 5px;
@@ -506,20 +762,23 @@ class PhylogenyApp(QWidget):
         
         # Tabs
         tabs = QTabWidget()
-        tabs.addTab(self.create_pipeline_tab(), "Pipeline")
+        tabs.addTab(self.create_single_gene_tab(), "Single-Gene")
+        tabs.addTab(self.create_multilocus_tab(), "Multilocus")
         tabs.addTab(self.create_parameters_tab(), "Parameters")
         tabs.addTab(self.create_history_tab(), "History")
         main_layout.addWidget(tabs)
         
-    def create_pipeline_tab(self):
-        """Main pipeline tab with split layout."""
+        # CHAMAR SET_LOG_COLORS AQUI (No final de tudo)
+        self.set_log_colors()
+    
+    def create_single_gene_tab(self):
+        """Single-gene pipeline tab."""
         tab = QWidget()
         main_layout = QHBoxLayout(tab)
         
-        # Create splitter for left/right division
         splitter = QSplitter(Qt.Horizontal)
         
-        # ========== LEFT SIDE: Controls ==========
+        # LEFT SIDE
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 5, 0)
@@ -540,7 +799,6 @@ class PhylogenyApp(QWidget):
         file_layout.addWidget(browse_btn)
         input_layout.addLayout(file_layout)
         
-        # Preview area
         self.preview_text = QTextEdit()
         self.preview_text.setReadOnly(True)
         self.preview_text.setMaximumHeight(100)
@@ -635,7 +893,7 @@ class PhylogenyApp(QWidget):
         
         left_layout.addWidget(logo_container)
         
-        # ========== RIGHT SIDE: Log ==========
+        # RIGHT SIDE
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(5, 0, 0, 0)
@@ -645,23 +903,242 @@ class PhylogenyApp(QWidget):
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.set_log_colors()
+        # REMOVIDO DAQUI: self.set_log_colors() 
         log_layout.addWidget(self.log_text)
         
         right_layout.addWidget(log_group)
         
-        # Add both sides to splitter
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
-        
-        # Set initial sizes (40% left, 60% right)
         splitter.setSizes([400, 600])
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
         
         main_layout.addWidget(splitter)
         
         return tab
+    
+    def create_multilocus_tab(self):
+        """Multilocus pipeline tab."""
+        tab = QWidget()
+        main_layout = QHBoxLayout(tab)
+        
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # LEFT SIDE
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 5, 0)
+        
+        # Gene List Section
+        genes_group = QGroupBox("GENE FILES")
+        genes_layout = QVBoxLayout(genes_group)
+        
+        self.gene_list_widget = QListWidget()
+        self.gene_list_widget.setMinimumHeight(200)
+        genes_layout.addWidget(self.gene_list_widget)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        add_gene_btn = QPushButton("Add Gene")
+        add_gene_btn.clicked.connect(self.add_gene)
+        btn_layout.addWidget(add_gene_btn)
+        
+        remove_gene_btn = QPushButton("Remove Selected")
+        remove_gene_btn.clicked.connect(self.remove_gene)
+        btn_layout.addWidget(remove_gene_btn)
+        
+        clear_genes_btn = QPushButton("Clear All")
+        clear_genes_btn.clicked.connect(self.clear_genes)
+        btn_layout.addWidget(clear_genes_btn)
+        
+        genes_layout.addLayout(btn_layout)
+        
+        left_layout.addWidget(genes_group)
+        
+        # Method Selection
+        method_group = QGroupBox("Phylogenetic Method")
+        method_layout = QVBoxLayout(method_group)
+        
+        self.multilocus_radio_group = QButtonGroup()
+        self.multilocus_radio_ml = QRadioButton("Maximum Likelihood (Partitioned)")
+        self.multilocus_radio_bi = QRadioButton("Bayesian Inference (Partitioned)")
+        
+        self.multilocus_radio_ml.setChecked(True)
+        
+        self.multilocus_radio_group.addButton(self.multilocus_radio_ml, 2)
+        self.multilocus_radio_group.addButton(self.multilocus_radio_bi, 3)
+        
+        method_layout.addWidget(self.multilocus_radio_ml)
+        method_layout.addWidget(self.multilocus_radio_bi)
+        
+        left_layout.addWidget(method_group)
+        
+        # Control Section
+        control_layout = QHBoxLayout()
+        
+        self.multilocus_start_button = QPushButton("RUN CONCATENATED ANALYSIS")
+        self.multilocus_start_button.setMinimumHeight(50)
+        self.multilocus_start_button.setFont(QFont('Arial', 12, QFont.Bold))
+        self.multilocus_start_button.clicked.connect(self.start_multilocus_pipeline)
+        control_layout.addWidget(self.multilocus_start_button)
+        
+        self.multilocus_stop_button = QPushButton("STOP")
+        self.multilocus_stop_button.setEnabled(False)
+        self.multilocus_stop_button.clicked.connect(self.stop_pipeline)
+        control_layout.addWidget(self.multilocus_stop_button)
+        
+        left_layout.addLayout(control_layout)
+        
+        # Progress Section
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        
+        self.multilocus_stage_label = QLabel("Ready to start...")
+        self.multilocus_stage_label.setFont(QFont('Arial', 10, QFont.Bold))
+        progress_layout.addWidget(self.multilocus_stage_label)
+        
+        self.multilocus_progress_bar = QProgressBar()
+        self.multilocus_progress_bar.setMinimum(0)
+        self.multilocus_progress_bar.setMaximum(100)
+        progress_layout.addWidget(self.multilocus_progress_bar)
+        
+        left_layout.addWidget(progress_group)
+        left_layout.addStretch()
+        
+        # RIGHT SIDE: Log
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(5, 0, 0, 0)
+        
+        log_group = QGroupBox("Execution Log")
+        log_layout = QVBoxLayout(log_group)
+        
+        self.multilocus_log_text = QTextEdit()
+        self.multilocus_log_text.setReadOnly(True)
+        log_layout.addWidget(self.multilocus_log_text)
+        
+        right_layout.addWidget(log_group)
+        
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([400, 600])
+        
+        main_layout.addWidget(splitter)
+        
+        return tab
+    
+    def add_gene(self):
+        """Add gene file to multilocus list."""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Select Gene FASTA File", "",
+            "FASTA Files (*.fasta *.fa *.fna);;All Files (*)"
+        )
+        
+        if filepath:
+            # CORREÇÃO AQUI: QInputDialog em vez de QMessageBox
+            gene_name, ok = QInputDialog.getText(
+                self, "Gene Name",
+                f"Enter name for this gene (e.g., matK, rbcL):",
+                text=Path(filepath).stem
+            )
+            
+            if ok and gene_name:
+                self.gene_list.append((gene_name, filepath))
+                self.gene_list_widget.addItem(f"{gene_name} - {Path(filepath).name}")
+    
+    def remove_gene(self):
+        """Remove selected gene from list."""
+        current_row = self.gene_list_widget.currentRow()
+        if current_row >= 0:
+            self.gene_list_widget.takeItem(current_row)
+            self.gene_list.pop(current_row)
+    
+    def clear_genes(self):
+        """Clear all genes from list."""
+        self.gene_list_widget.clear()
+        self.gene_list.clear()
+    
+    def start_multilocus_pipeline(self):
+        """Start multilocus analysis."""
+        if len(self.gene_list) < 2:
+            QMessageBox.warning(self, "Insufficient Data",
+                              "Please add at least 2 gene files for multilocus analysis.")
+            return
+        
+        choice = str(self.multilocus_radio_group.checkedId())
+        params = self.get_parameters()
+        
+        self.multilocus_log_text.clear()
+        self.multilocus_log(f"Starting multilocus analysis with {len(self.gene_list)} genes:", 'highlight')
+        for gene_name, _ in self.gene_list:
+            self.multilocus_log(f"  - {gene_name}", 'default')
+        
+        self.multilocus_start_button.setEnabled(False)
+        self.multilocus_stop_button.setEnabled(True)
+        self.multilocus_progress_bar.setValue(0)
+        
+        # Create worker thread
+        self.thread = QThread()
+        self.worker = MultilocusWorker(self.gene_list, choice, params)
+        self.worker.moveToThread(self.thread)
+        
+        # Connect signals
+        self.thread.started.connect(self.worker.run)
+        self.worker.log_message.connect(self.multilocus_log)
+        self.worker.progress_update.connect(self.multilocus_progress_bar.setValue)
+        self.worker.stage_update.connect(self.multilocus_stage_label.setText)
+        self.worker.finished.connect(self.multilocus_pipeline_finished)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        
+        self.thread.start()
+    
+    def multilocus_log(self, message, message_type='default'):
+        """Log message to multilocus log."""
+        cursor = self.multilocus_log_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        
+        if message_type == 'error':
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor("#E74C3C"))
+            fmt.setFontWeight(QFont.Bold)
+        elif message_type == 'success':
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor("#27AE60"))
+            fmt.setFontWeight(QFont.Bold)
+        elif message_type == 'highlight':
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor("#3498DB"))
+            fmt.setFontWeight(QFont.Bold)
+        else:
+            fmt = QTextCharFormat()
+        
+        cursor.insertText(message + "\n", fmt)
+        self.multilocus_log_text.setTextCursor(cursor)
+        self.multilocus_log_text.ensureCursorVisible()
+    
+    def multilocus_pipeline_finished(self, success, results):
+        """Handle multilocus pipeline completion."""
+        self.multilocus_start_button.setEnabled(True)
+        self.multilocus_stop_button.setEnabled(False)
+        self.thread.quit()
+        self.thread.wait()
+        
+        if success:
+            self.multilocus_log("="*60, 'success')
+            self.multilocus_log("MULTILOCUS ANALYSIS COMPLETED!", 'success')
+            self.multilocus_log("="*60, 'success')
+            
+            QMessageBox.information(self, "Success",
+                                  f"Multilocus analysis completed!\n\n"
+                                  f"Time: {results.get('execution_time', 0):.2f}s")
+        else:
+            self.multilocus_log("="*60, 'error')
+            self.multilocus_log("MULTILOCUS ANALYSIS FAILED", 'error')
+            self.multilocus_log("="*60, 'error')
+            
+            QMessageBox.critical(self, "Error",
+                               "Multilocus pipeline failed. Check the log for details.")
     
     def create_parameters_tab(self):
         """Parameters configuration tab."""
@@ -707,16 +1184,15 @@ class PhylogenyApp(QWidget):
         iqtree_model_h.addWidget(QLabel("Model:"))
         self.iqtree_model = QComboBox()
         
-        # Modelos atualizados conforme o artigo
         models = [
-            'MFP',          # ModelFinder Plus (Recomendado)
-            'GTR+I+G',      # Matriz completa (D270) e ndhF
-            'TVM+I+G',      # matK e rbcL
-            'GTR+G',        # rps16 e trnL-F
-            'HKY+I+G',      
-            'K2P+G',        
-            'TIM+I+G',      
-            'SYM+I+G'       
+            'MFP',
+            'GTR+I+G',
+            'TVM+I+G',
+            'GTR+G',
+            'HKY+I+G',
+            'K2P+G',
+            'TIM+I+G',
+            'SYM+I+G'
         ]
         
         self.iqtree_model.addItems(models)
@@ -762,7 +1238,6 @@ class PhylogenyApp(QWidget):
         adv_group = QGroupBox("Advanced Options")
         adv_layout = QVBoxLayout(adv_group)
         
-        # Outgroup Selection
         outgroup_h = QHBoxLayout()
         outgroup_h.addWidget(QLabel("Outgroup (Root):"))
         self.outgroup_combo = QComboBox()
@@ -770,7 +1245,6 @@ class PhylogenyApp(QWidget):
         outgroup_h.addWidget(self.outgroup_combo)
         adv_layout.addLayout(outgroup_h)
         
-        # UltraFast Bootstrap Checkbox
         self.ufboot_check = QCheckBox("Use UltraFast Bootstrap (IQ-TREE)")
         self.ufboot_check.setChecked(True)
         self.ufboot_check.setToolTip("Much faster and robust than standard bootstrap (-bb)")
@@ -782,7 +1256,6 @@ class PhylogenyApp(QWidget):
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
         
-        # Reset button
         reset_btn = QPushButton("Reset to Defaults")
         reset_btn.clicked.connect(self.reset_parameters)
         layout.addWidget(reset_btn)
@@ -833,6 +1306,7 @@ class PhylogenyApp(QWidget):
     def set_log_colors(self):
         """Define log text formats."""
         self.log_text.setFont(QFont("Courier New", 9))
+        self.multilocus_log_text.setFont(QFont("Courier New", 9))
         
         self.fmt_error = QTextCharFormat()
         self.fmt_error.setForeground(QColor("#E74C3C"))
@@ -870,7 +1344,6 @@ class PhylogenyApp(QWidget):
             self.input_line.setText(Path(filepath).name)
             self.log(f"File selected: {Path(filepath).name}", 'highlight')
             
-            # Validate and show preview
             valid, issues, stats = validate_fasta(filepath)
             
             preview_text = ""
@@ -1033,7 +1506,6 @@ class PhylogenyApp(QWidget):
             
             self.log(f"\nTotal time: {results.get('execution_time', 0):.2f} seconds", 'success')
             
-            # Save to history
             history_entry = {
                 'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'file': self.input_line.text(),
@@ -1069,9 +1541,6 @@ class PhylogenyApp(QWidget):
         self.progress_bar.setValue(100 if success else 0)
         self.stage_label.setText("Completed" if success else "Failed")
 
-# ==============================================================================
-# --- 4. MAIN EXECUTION ---
-# ==============================================================================
 
 if __name__ == "__main__":
     os.chdir(Path(__file__).parent)
