@@ -133,12 +133,12 @@ def analyze_alignment(filepath):
         return {}
 
 def concatenate_alignments(gene_files, output_file, partition_file):
-    """Concatenates multiple aligned FASTA files and creates partition file."""
     from collections import defaultdict
     
     all_sequences = defaultdict(str)
     partitions = []
     current_pos = 1
+    total_length_so_far = 0 
     
     for gene_name, gene_file in gene_files:
         # Read alignment
@@ -161,10 +161,14 @@ def concatenate_alignments(gene_files, output_file, partition_file):
         # Get alignment length
         if sequences:
             gene_length = len(list(sequences.values())[0])
-            
-            # Add sequences (fill with gaps if missing)
             all_ids = set(all_sequences.keys()) | set(sequences.keys())
+            
             for seq_id in all_ids:
+                current_seq_len = len(all_sequences[seq_id])
+                if current_seq_len < total_length_so_far:
+                    gap_padding = total_length_so_far - current_seq_len
+                    all_sequences[seq_id] += '-' * gap_padding
+                
                 if seq_id in sequences:
                     all_sequences[seq_id] += sequences[seq_id]
                 else:
@@ -173,8 +177,9 @@ def concatenate_alignments(gene_files, output_file, partition_file):
             # Record partition
             end_pos = current_pos + gene_length - 1
             partitions.append(f"DNA, {gene_name} = {current_pos}-{end_pos}")
+            
             current_pos = end_pos + 1
-    
+            total_length_so_far += gene_length 
     # Write concatenated alignment
     with open(output_file, 'w') as f:
         for seq_id, seq in all_sequences.items():
@@ -186,8 +191,8 @@ def concatenate_alignments(gene_files, output_file, partition_file):
         for partition in partitions:
             f.write(partition + '\n')
     
-    return len(all_sequences), sum(len(seq) for seq in all_sequences.values()) // len(all_sequences)
-
+    return len(all_sequences), total_length_so_far
+# --- Docker Command Runner ---
 # --- Docker Command Runner ---
 def run_docker_command(container_name, command, log_callback, progress_callback=None):
     """Executes Docker command with progress updates."""
@@ -205,12 +210,11 @@ def run_docker_command(container_name, command, log_callback, progress_callback=
         process = subprocess.Popen(
             full_command,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True
         )
         
         stdout_lines = []
-        stderr_lines = []
         
         while True:
             output = process.stdout.readline()
@@ -221,18 +225,11 @@ def run_docker_command(container_name, command, log_callback, progress_callback=
                 log_callback.emit(output.strip(), 'default')
                 if progress_callback:
                     progress_callback.emit(5)
-        
-        stderr_output = process.stderr.read()
-        if stderr_output:
-            stderr_lines.append(stderr_output.strip())
-        
         returncode = process.poll()
         
         if returncode != 0:
             log_callback.emit(f"ERROR: Command failed with code {returncode}", 'error')
-            if stderr_output:
-                log_callback.emit(f"STDERR:\n{stderr_output}", 'error')
-            raise subprocess.CalledProcessError(returncode, full_command, stderr=stderr_output)
+            raise subprocess.CalledProcessError(returncode, full_command)
         
         log_callback.emit("Command completed successfully!", 'success')
         return True
